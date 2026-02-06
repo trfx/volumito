@@ -15,13 +15,7 @@ import threading
 import time
 import yaml
 import requests
-
-try:
-    import urwid
-except Exception:
-    print("urwid is not installed. Install with: pip install urwid")
-    sys.exit(1)
-
+import urwid
 
 class VolumitoV1:
     def __init__(self):
@@ -42,8 +36,8 @@ class VolumitoV1:
         config_file = os.path.join(config_dir, "config.yaml")
         if not os.path.exists(config_file):
             with open(config_file, "w") as f:
-                f.write("volumio_host: 127.0.0.1\n")
-            print(f"Created default config file at {config_file}. Please edit it with your Volumio host.")
+                f.write("volumio_host: volumio.local\n")
+            print(f"Created default config file at {config_file}. Please edit it to set your Volumio host and run again.")
             sys.exit(0)
         with open(config_file, "r") as f:
             content = f.read()
@@ -76,7 +70,7 @@ class VolumitoV1:
 
     def build_ui(self):
         # Widgets that will be updated
-        self.header = urwid.Text(('header', 'Volumito - Volumio Remote Control'), align='left')
+        self.header = urwid.Text(('header', 'Volumito - A Simple TUI for Volumio'), align='left')
         self.title_label = urwid.Text('Current Track: ')
         self.title_value = urwid.Text('?', wrap='clip')
         self.artist_label = urwid.Text('Artist: ')
@@ -85,59 +79,75 @@ class VolumitoV1:
         self.album_value = urwid.Text('?', wrap='clip')
         self.state_label = urwid.Text('Playback State: ')
         self.state_value = urwid.Text('?', wrap='clip')
-        # volume shown as a progress bar (0-100) and a compact text
-        self.volume_bar = urwid.ProgressBar('pg normal', 'pg complete', 0, 100)
-        self.volume_text = urwid.Text('Vol: ?')
+        self.bitrate_label = urwid.Text('Sample Rate: ')
+        self.bitrate_value = urwid.Text('?', wrap='clip')
+        self.elapsed_label = urwid.Text('Elapsed: ')
+        self.elapsed_value = urwid.Text('--:--', wrap='clip')
+        self.length_label = urwid.Text('Length: ')
+        self.length_value = urwid.Text('--:--', wrap='clip')
+        self.volume_label = urwid.Text('Volume: ')
+        self.volume_text = urwid.Text('--')
+        self.server_label = urwid.Text('Server: ')
+        self.server_text = urwid.Text(self.config.get("volumio_host", "-"))
         self.last_key = urwid.Text('')
-        # progress bar and time
+        # progress bar for visual track progress
         self.progress = urwid.ProgressBar('pg normal', 'pg complete', 0, 100)
-        self.progress_time = urwid.Text('00:00 / 00:00')
 
         # Rows with colored value using palette entry 'title'
         row_title = urwid.Columns([
             ('fixed', 16, self.title_label),
-            urwid.AttrMap(self.title_value, 'title')
+            urwid.AttrMap(self.title_value, 'highlight')
         ])
         row_artist = urwid.Columns([
             ('fixed', 16, self.artist_label),
-            urwid.AttrMap(self.artist_value, 'title')
+            urwid.AttrMap(self.artist_value, 'highlight')
         ])
         row_album = urwid.Columns([
             ('fixed', 16, self.album_label),
-            urwid.AttrMap(self.album_value, 'title')
+            urwid.AttrMap(self.album_value, 'normal')
         ])
         row_state = urwid.Columns([
             ('fixed', 16, self.state_label),
-            urwid.AttrMap(self.state_value, 'title')
+            urwid.AttrMap(self.state_value, 'normal')
+        ])
+        row_bitrate = urwid.Columns([
+            ('fixed', 16, self.bitrate_label),
+            urwid.AttrMap(self.bitrate_value, 'normal')
+        ])
+        row_elapsed = urwid.Columns([
+            ('fixed', 16, self.elapsed_label),
+            urwid.AttrMap(self.elapsed_value, 'normal')
+        ])
+        row_length = urwid.Columns([
+            ('fixed', 16, self.length_label),
+            urwid.AttrMap(self.length_value, 'normal')
+        ])
+        row_volume = urwid.Columns([
+            ('fixed', 16, self.volume_label),
+            urwid.AttrMap(self.volume_text, 'normal')
         ])
 
-        # progress row combines a bar and a time text; ensure the time never wraps
-        progress_row = urwid.Columns([
-            ('weight', 1, self.progress),
-            ('fixed', 20, urwid.Padding(self.progress_time, left=1, right=1))
+        row_server = urwid.Columns([
+            ('fixed', 16, self.server_label),
+            urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        # volume row: progress bar plus numeric indicator
-        # make the volume bar use the same fixed width for the right column as the progress row
-        volume_row = urwid.Columns([
-            ('weight', 1, self.volume_bar),
-            ('fixed', 20, urwid.Padding(self.volume_text, left=1, right=1))
-        ])
+        # progress bar for visual track progress
 
-        legend = urwid.Text('+:- vol | p: play/pause | <: prev | >: next | q: quit')
+        legend = urwid.AttrMap(urwid.Text('+:- vol | p: play/pause | <: prev | >: next | q: quit'), 'bold')
 
         pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
-            urwid.Divider('-'),
             row_title,
             row_artist,
             row_album,
             row_state,
-            urwid.Divider(),
-            progress_row,
-            urwid.Divider(),
-            volume_row,
-            urwid.Divider(),
+            row_bitrate,
+            row_elapsed,
+            row_length,
+            row_volume,
+            row_server,
+            self.progress,
             legend,
             urwid.Divider(),
             self.last_key,
@@ -148,17 +158,23 @@ class VolumitoV1:
     def refresh_ui(self, loop=None, user_data=None):
         with self._status_lock:
             s = dict(self.status)
-        title = s.get('title', '?')
-        artist = s.get('artist', '?')
-        album = s.get('album', '?')
-        state = s.get('status', '?')
-        vol = s.get('volume', '?')
+        title = s.get('title', '-')
+        artist = s.get('artist', '-')
+        album = s.get('album', '-')
+        state = s.get('status', '-')
+        samplerate = s.get('samplerate')
+        bitrate = s.get('bitrate')
+        # Prefer samplerate, fall back to bitrate, then to '-'
+        display_rate = samplerate if samplerate is not None else bitrate
+        display_rate = '-' if display_rate is None else str(display_rate)
+        vol = s.get('volume', '-')
 
         self.title_value.set_text(title)
         self.artist_value.set_text(artist)
         self.album_value.set_text(album)
         self.state_value.set_text(state)
-        # update volume progress bar and compact text
+        self.bitrate_value.set_text(display_rate)
+        # update volume text
         try:
             vnum = int(vol) if vol is not None else 0
         except Exception:
@@ -166,11 +182,7 @@ class VolumitoV1:
                 vnum = int(float(vol))
             except Exception:
                 vnum = 0
-        try:
-            self.volume_bar.set_completion(max(0, min(100, vnum)))
-        except Exception:
-            pass
-        self.volume_text.set_text(f"Vol: {vnum}")
+        self.volume_text.set_text(f"{vnum}")
 
         # update progress bar
         def _parse_time(v):
@@ -303,13 +315,15 @@ class VolumitoV1:
                 sec = int(t % 60)
                 return f"{m:02d}:{sec:02d}"
             try:
-                self.progress_time.set_text(f"{_fmt(seek_s)} / {_fmt(dur_s)}")
+                self.elapsed_value.set_text(_fmt(seek_s))
+                self.length_value.set_text(_fmt(dur_s))
             except Exception:
                 pass
         else:
             try:
                 self.progress.set_completion(0)
-                self.progress_time.set_text('00:00 / 00:00')
+                self.elapsed_value.set_text('--:--')
+                self.length_value.set_text('--:--')
             except Exception:
                 pass
 
@@ -543,10 +557,12 @@ class VolumitoV1:
         # build UI
         top = self.build_ui()
         palette = [
-            ('header', 'light green', '', 'bold'),
-            ('title', 'light green', ''),
-            ('pg normal', 'black', 'light gray'),
-            ('pg complete', 'black', 'light green'),
+            ('header', 'bold', 'dark gray'),
+            ('highlight', 'standout', 'default'),
+            ('normal', 'default', 'default'),
+            ('bold', 'bold', 'dark gray'),
+            ('pg normal', 'default', 'dark gray'),
+            ('pg complete', 'white', 'dark blue'),
         ]
         self.loop = urwid.MainLoop(top, palette, unhandled_input=self.unhandled_input)
         # start periodic UI refresh
