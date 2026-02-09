@@ -7,6 +7,11 @@ This file is a lightweight rework that tries another TUI framework (urwid)
 which generally handles colors and attributes more reliably across terminals.
 
 If urwid is not installed, the script will instruct how to install it.
+
+TODO:
+- Add error handling for network issues and display a message in the UI
+- Add support for more Volumio commands (e.g. stop, mute, repeat, shuffle)
+- Add google/wikipedia search keybind for current track/artist/album
 """
 
 import os
@@ -562,7 +567,7 @@ class VolumitoV1:
             ('normal', 'default', 'default'),
             ('bold', 'bold', 'dark gray'),
             ('pg normal', 'default', 'dark gray'),
-            ('pg complete', 'white', 'dark blue'),
+            ('pg complete', 'white', 'black'),
         ]
         self.loop = urwid.MainLoop(top, palette, unhandled_input=self.unhandled_input)
         # start periodic UI refresh
