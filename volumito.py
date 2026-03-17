@@ -157,9 +157,13 @@ class VolumitoV1:
         with self._status_lock:
             s = dict(self.status)
         title = s.get('title', '-')
+        title = '-' if title is None else str(title)
         artist = s.get('artist', '-')
+        artist = '-' if artist is None else str(artist)
         album = s.get('album', '-')
+        album = '-' if album is None else str(album)
         state = s.get('status', '-')
+        state = '-' if state is None else str(state)
         samplerate = s.get('samplerate')
         bitrate = s.get('bitrate')
         # Prefer samplerate, fall back to bitrate, then to '-'
