@@ -21,29 +21,33 @@ import time
 import yaml
 import requests
 import urwid
+from volumio_client import VolumioClient
 
 class VolumitoV1:
     def __init__(self):
         self.config = self.check_config()
+        self.client = VolumioClient(self.config.get("volumio_host"))
         self.status = {}
         self._status_lock = threading.Lock()
-        self.session = requests.Session()
         self._stop_event = threading.Event()
         self.updater = None
         self.loop = None
         # recent seek target to avoid UI bounce (tuple: (seconds, timestamp))
         self._recent_seek = None
+        # loading text for initial poll
+        self.loading_text = urwid.Text("Polling volumio...", align='center')
 
     def check_config(self, config_dir="~/.config/volumito/"):
         config_dir = os.path.expanduser(config_dir)
         if not os.path.exists(config_dir):
             os.makedirs(config_dir)
         config_file = os.path.join(config_dir, "config.yaml")
+        # remember config path for UI messages
+        self.config_path = config_file
         if not os.path.exists(config_file):
+            # silently create default config and continue
             with open(config_file, "w") as f:
                 f.write("volumio_host: volumio.local\n")
-            print(f"Created default config file at {config_file}. Please edit it to set your Volumio host and run again.")
-            sys.exit(0)
         with open(config_file, "r") as f:
             content = f.read()
             if "volumio_host" not in content:
@@ -55,21 +59,17 @@ class VolumitoV1:
                 print(f"Error parsing config: {e}")
                 sys.exit(1)
 
-    def read_status(self):
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/getState"
-        try:
-            r = self.session.get(url, timeout=3)
-            if r.status_code != 200:
-                return {}
-            return r.json()
-        except Exception:
-            return {}
-
     def _updater(self):
         while not self._stop_event.is_set():
-            s = self.read_status()
-            if isinstance(s, dict):
+            s = self.client.get_state()
+            if s is None:
+                # mark unreachable and continue trying
                 with self._status_lock:
+                    self.status['__unreachable'] = True
+            elif isinstance(s, dict):
+                with self._status_lock:
+                    # clear unreachable flag when we get a response
+                    self.status.pop('__unreachable', None)
                     self._merge_status(s)
             time.sleep(1)
 
@@ -139,7 +139,7 @@ class VolumitoV1:
 
         # progress bar for visual track progress
 
-        legend = urwid.AttrMap(urwid.Text('+:- vol | p: play/pause | <: prev | >: next | q: quit'), 'bold')
+        legend = urwid.AttrMap(urwid.Text('+:- vol | SPC: play/pause | <: prev | >: next | q: quit'), 'bold')
 
         pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
@@ -163,10 +163,27 @@ class VolumitoV1:
     def refresh_ui(self, loop=None, user_data=None):
         with self._status_lock:
             s = dict(self.status)
+        # Update server reachability message
+        host = self.config.get('volumio_host', '-')
+        if s.get('__unreachable'):
+            cfg_path = getattr(self, 'config_path', None) or '~/.config/volumito/config.yaml'
+            try:
+                self.server_text.set_text(f"{host} is unreachable please edit the config file at {cfg_path}")
+            except Exception:
+                pass
+        else:
+            try:
+                self.server_text.set_text(host)
+            except Exception:
+                pass
         title = s.get('title', '-')
+        title = '-' if title is None else str(title)
         artist = s.get('artist', '-')
+        artist = '-' if artist is None else str(artist)
         album = s.get('album', '-')
+        album = '-' if album is None else str(album)
         state = s.get('status', '-')
+        state = '-' if state is None else str(state)
         samplerate = s.get('samplerate')
         bitrate = s.get('bitrate')
         # Prefer samplerate, fall back to bitrate, then to '-'
@@ -190,124 +207,7 @@ class VolumitoV1:
         self.volume_text.set_text(f"{vnum}")
 
         # update progress bar
-        def _parse_time(v):
-            if v is None:
-                return None
-            try:
-                return float(v)
-            except Exception:
-                pass
-            try:
-                parts = [float(x) for x in str(v).split(':')]
-                if len(parts) == 3:
-                    return parts[0] * 3600 + parts[1] * 60 + parts[2]
-                if len(parts) == 2:
-                    return parts[0] * 60 + parts[1]
-                return float(parts[0])
-            except Exception:
-                return None
-
-        # helper to search nested dict/list for candidate keys and return all matches
-        def _deep_find_all(obj, candidates):
-            res = []
-            if obj is None:
-                return res
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    kl = k.lower()
-                    for cand in candidates:
-                        if cand in kl:
-                            res.append(v)
-                    res.extend(_deep_find_all(v, candidates))
-            elif isinstance(obj, list):
-                for item in obj:
-                    res.extend(_deep_find_all(item, candidates))
-            return res
-
-        # collect candidate values (prefer top-level if present)
-        seek_candidates = []
-        dur_candidates = []
-        for k in ('seek', 'position', 'elapsed', 'progress'):
-            if k in s:
-                seek_candidates.append(s.get(k))
-        for k in ('duration', 'trackDuration', 'totalTime', 'length', 'tracklength'):
-            if k in s:
-                dur_candidates.append(s.get(k))
-        # extend with deep search
-        seek_candidates.extend(_deep_find_all(s, ['seek', 'position', 'elapsed', 'progress']))
-        dur_candidates.extend(_deep_find_all(s, ['duration', 'trackduration', 'totaltime', 'length', 'tracklength', 'time', 'total']))
-
-        def _to_number(v):
-            t = _parse_time(v)
-            if t is None:
-                return None
-            return float(t)
-
-        # try combinations of raw vs milliseconds conversion for seek/duration
-        seek_s = None
-        dur_s = None
-        pairs = []
-        for sv_raw in seek_candidates:
-            svn = _to_number(sv_raw)
-            if svn is None:
-                continue
-            for dv_raw in dur_candidates:
-                dvn = _to_number(dv_raw)
-                if dvn is None:
-                    continue
-                for sv_factor in (1.0, 1.0/1000.0):
-                    for dv_factor in (1.0, 1.0/1000.0):
-                        try:
-                            svs = svn * sv_factor
-                            dvs = dvn * dv_factor
-                        except Exception:
-                            continue
-                        # plausible: seek between 0 and duration (allow small overshoot) and duration reasonable (<10h)
-                        if 0 <= svs <= dvs * 1.1 and 0 < dvs < 36000:
-                            pairs.append((svs, dvs, sv_factor, dv_factor))
-        # prefer pairs where duration was not treated as milliseconds (dv_factor == 1.0), then smaller duration
-        if pairs:
-            pairs.sort(key=lambda x: (0 if x[3] == 1.0 else 1, x[1]))
-            seek_s, dur_s, _, _ = pairs[0]
-        else:
-            # fallback: take first sensible duration (prefer not-converted)
-            dur_s = None
-            for dv_raw in dur_candidates:
-                dvn = _to_number(dv_raw)
-                if dvn is None:
-                    continue
-                if 0 < dvn < 36000:
-                    dur_s = dvn
-                    break
-                if dvn > 1000:
-                    # try ms->s
-                    try:
-                        cand = dvn / 1000.0
-                        if 0 < cand < 36000:
-                            dur_s = cand
-                            break
-                    except Exception:
-                        pass
-            seek_s = None
-            for sv_raw in seek_candidates:
-                svn = _to_number(sv_raw)
-                if svn is None:
-                    continue
-                if 0 <= svn <= (dur_s or float('inf')) * 1.1:
-                    seek_s = svn
-                    break
-            # final fallback convert if needed
-            if seek_s is None:
-                for sv_raw in seek_candidates:
-                    svn = _to_number(sv_raw)
-                    if svn is None:
-                        continue
-                    if svn > 1000:
-                        seek_s = svn / 1000.0
-                        break
-                    seek_s = svn
-            if dur_s is None:
-                dur_s = 0
+        seek_s, dur_s = self.client.parse_status_times(s)
 
         if dur_s and dur_s > 0:
             pct = int(max(0, min(100, (seek_s / dur_s) * 100)))
@@ -336,6 +236,21 @@ class VolumitoV1:
         if self.loop:
             self.loop.set_alarm_in(0.25, self.refresh_ui)
 
+    def animate_loading(self, loop=None, user_data=None):
+        current = self.loading_text.get_text()[0]
+        if current == "Polling volumio...":
+            new = "Polling volumio"
+        elif current == "Polling volumio":
+            new = "Polling volumio."
+        elif current == "Polling volumio.":
+            new = "Polling volumio.."
+        elif current == "Polling volumio..":
+            new = "Polling volumio..."
+        else:
+            new = "Polling volumio..."
+        self.loading_text.set_text(new)
+        self.loop.set_alarm_in(0.5, self.animate_loading)
+
     def unhandled_input(self, key):
         # store last key for feedback (show ord if a single char)
         try:
@@ -363,7 +278,7 @@ class VolumitoV1:
             return
 
         # play/pause
-        if klower in ('p',):
+        if klower in ('p', ' '):
             self._toggle_play()
             return
 
@@ -394,8 +309,7 @@ class VolumitoV1:
         new = max(0, min(100, cur + delta))
         with self._status_lock:
             self.status['volume'] = new
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=volume&volume=" + str(new)
-        threading.Thread(target=lambda: self._safe_get(url), daemon=True).start()
+        self.client.send_command('volume', volume=str(new))
 
     def _toggle_play(self):
         with self._status_lock:
@@ -408,26 +322,18 @@ class VolumitoV1:
             new_state = 'play'
         with self._status_lock:
             self.status['status'] = new_state
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=" + cmd
-        threading.Thread(target=lambda: self._safe_get(url), daemon=True).start()
+        self.client.send_command(cmd)
 
     def _send_cmd(self, cmd):
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=" + cmd
         # send the command and then refresh state to reflect track change quickly
-        def _worker(u):
-            try:
-                self._safe_get(u)
-            except Exception:
-                pass
+        def _worker():
+            self.client.send_command(cmd)
             # attempt to fetch updated state
-            try:
-                r = self.session.get("http://" + self.config.get("volumio_host") + "/api/v1/getState", timeout=2)
-                if r.status_code == 200:
-                    with self._status_lock:
-                        self._merge_status(r.json())
-            except Exception:
-                pass
-        threading.Thread(target=_worker, args=(url,), daemon=True).start()
+            s = self.client.get_state()
+            if s:
+                with self._status_lock:
+                    self._merge_status(s)
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _merge_status(self, new):
         """Merge new status dict into self.status while avoiding seek/position bounce
@@ -464,12 +370,6 @@ class VolumitoV1:
             return
         # normal merge
         self.status.update(new)
-
-    def _safe_get(self, url):
-        try:
-            self.session.get(url, timeout=3)
-        except Exception:
-            pass
 
     def _seek_relative(self, delta_seconds):
         """Seek relative by delta_seconds (positive or negative). Attempts several seek command variants and updates UI immediately."""
@@ -529,38 +429,18 @@ class VolumitoV1:
             except Exception:
                 self._recent_seek = (new_pos, time.time())
 
-        secs = int(new_pos)
-        msecs = int(new_pos * 1000)
-        candidates = [
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&value={secs}",
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&position={secs}",
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&seek={msecs}",
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&seek={secs}",
-        ]
+        def _worker():
+            self.client.send_seek(new_pos)
+            s = self.client.get_state()
+            if s:
+                with self._status_lock:
+                    self._merge_status(s)
 
-        def _worker(u_list):
-            for u in u_list:
-                try:
-                    self.session.get(u, timeout=2)
-                except Exception:
-                    continue
-            try:
-                r = self.session.get(f"http://{self.config.get('volumio_host')}/api/v1/getState", timeout=2)
-                if r.status_code == 200:
-                    with self._status_lock:
-                        self._merge_status(r.json())
-            except Exception:
-                pass
-
-        threading.Thread(target=_worker, args=(candidates,), daemon=True).start()
+        threading.Thread(target=_worker, daemon=True).start()
 
     def run(self):
-        # start updater thread
-        self.updater = threading.Thread(target=self._updater, daemon=True)
-        self.updater.start()
-
-        # build UI
-        top = self.build_ui()
+        # build loading UI
+        loading_ui = urwid.Filler(self.loading_text, valign='middle')
         palette = [
             ('header', 'bold', 'dark gray'),
             ('highlight', 'standout', 'default'),
@@ -569,9 +449,34 @@ class VolumitoV1:
             ('pg normal', 'default', 'dark gray'),
             ('pg complete', 'white', 'black'),
         ]
-        self.loop = urwid.MainLoop(top, palette, unhandled_input=self.unhandled_input)
-        # start periodic UI refresh
-        self.loop.set_alarm_in(0.1, self.refresh_ui)
+        self.loop = urwid.MainLoop(loading_ui, palette, unhandled_input=self.unhandled_input)
+        # start loading animation
+        self.loop.set_alarm_in(0.5, self.animate_loading)
+
+        def fetch_initial():
+            # Fetch initial state
+            initial_state = self.client.get_state()
+            if initial_state is None:
+                with self._status_lock:
+                    self.status['__unreachable'] = True
+            elif isinstance(initial_state, dict):
+                with self._status_lock:
+                    self._merge_status(initial_state)
+
+            # build main UI
+            top = self.build_ui()
+            self.loop.widget = top
+
+            # start updater thread
+            self.updater = threading.Thread(target=self._updater, daemon=True)
+            self.updater.start()
+
+            # start periodic UI refresh
+            self.loop.set_alarm_in(0.1, self.refresh_ui)
+
+        # start fetch in background
+        threading.Thread(target=fetch_initial, daemon=True).start()
+
         try:
             self.loop.run()
         finally:
