@@ -13,7 +13,8 @@ class VolumioClient:
                 return r.json()
             return {}
         except Exception:
-            return {}
+            # Network or connection error: return None to signal unreachable host
+            return None
 
     def send_command(self, cmd, **params):
         url = f"http://{self.host}/api/v1/commands/?cmd={cmd}"

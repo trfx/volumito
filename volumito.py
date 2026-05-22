@@ -42,11 +42,12 @@ class VolumitoV1:
         if not os.path.exists(config_dir):
             os.makedirs(config_dir)
         config_file = os.path.join(config_dir, "config.yaml")
+        # remember config path for UI messages
+        self.config_path = config_file
         if not os.path.exists(config_file):
+            # silently create default config and continue
             with open(config_file, "w") as f:
                 f.write("volumio_host: volumio.local\n")
-            print(f"Created default config file at {config_file}. Please edit it to set your Volumio host and run again.")
-            sys.exit(0)
         with open(config_file, "r") as f:
             content = f.read()
             if "volumio_host" not in content:
@@ -61,8 +62,14 @@ class VolumitoV1:
     def _updater(self):
         while not self._stop_event.is_set():
             s = self.client.get_state()
-            if isinstance(s, dict):
+            if s is None:
+                # mark unreachable and continue trying
                 with self._status_lock:
+                    self.status['__unreachable'] = True
+            elif isinstance(s, dict):
+                with self._status_lock:
+                    # clear unreachable flag when we get a response
+                    self.status.pop('__unreachable', None)
                     self._merge_status(s)
             time.sleep(1)
 
@@ -156,6 +163,19 @@ class VolumitoV1:
     def refresh_ui(self, loop=None, user_data=None):
         with self._status_lock:
             s = dict(self.status)
+        # Update server reachability message
+        host = self.config.get('volumio_host', '-')
+        if s.get('__unreachable'):
+            cfg_path = getattr(self, 'config_path', None) or '~/.config/volumito/config.yaml'
+            try:
+                self.server_text.set_text(f"{host} is unreachable please edit the config file at {cfg_path}")
+            except Exception:
+                pass
+        else:
+            try:
+                self.server_text.set_text(host)
+            except Exception:
+                pass
         title = s.get('title', '-')
         title = '-' if title is None else str(title)
         artist = s.get('artist', '-')
@@ -436,7 +456,10 @@ class VolumitoV1:
         def fetch_initial():
             # Fetch initial state
             initial_state = self.client.get_state()
-            if isinstance(initial_state, dict):
+            if initial_state is None:
+                with self._status_lock:
+                    self.status['__unreachable'] = True
+            elif isinstance(initial_state, dict):
                 with self._status_lock:
                     self._merge_status(initial_state)
 
