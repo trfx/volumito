@@ -26,13 +26,21 @@ class VolumitoV1:
     def __init__(self):
         self.config = self.check_config()
         self.status = {}
+        self.queue = []
         self._status_lock = threading.Lock()
+        self._queue_lock = threading.Lock()
         self.session = requests.Session()
         self._stop_event = threading.Event()
         self.updater = None
         self.loop = None
         # recent seek target to avoid UI bounce (tuple: (seconds, timestamp))
         self._recent_seek = None
+        # playlist walker/listbox references (built in build_ui)
+        self._queue_walker = None
+        self._queue_listbox = None
+        # columns widget reference so we can show/hide playlist pane
+        self._columns = None
+        self._playlist_visible = False
 
     def check_config(self, config_dir="~/.config/volumito/"):
         config_dir = os.path.expanduser(config_dir)
@@ -65,13 +73,49 @@ class VolumitoV1:
         except Exception:
             return {}
 
+    def read_queue(self):
+        url = "http://" + self.config.get("volumio_host") + "/api/v1/getQueue"
+        try:
+            r = self.session.get(url, timeout=3)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            # Volumio returns {"queue": [...]} or just a list
+            if isinstance(data, dict):
+                return data.get("queue", [])
+            if isinstance(data, list):
+                return data
+            return []
+        except Exception:
+            return []
+
     def _updater(self):
+        tick = 0
         while not self._stop_event.is_set():
             s = self.read_status()
             if isinstance(s, dict):
                 with self._status_lock:
                     self._merge_status(s)
+            # fetch queue every 5 seconds (less critical than state)
+            if tick % 5 == 0:
+                q = self.read_queue()
+                if isinstance(q, list):
+                    with self._queue_lock:
+                        self.queue = q
+            tick += 1
             time.sleep(1)
+
+    def _make_queue_item(self, track, index, current_index):
+        """Build a urwid Text widget for a single queue entry."""
+        title = track.get("title") or track.get("name") or "Unknown"
+        artist = track.get("artist") or ""
+        label = f" {index + 1:>3}. {title}"
+        if artist:
+            label += f"  [{artist}]"
+        if index == current_index:
+            return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_current')
+        else:
+            return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_item')
 
     def build_ui(self):
         # Widgets that will be updated
@@ -137,11 +181,9 @@ class VolumitoV1:
             urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        # progress bar for visual track progress
+        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | q: quit'), 'bold')
 
-        legend = urwid.AttrMap(urwid.Text('+:- vol | p: play/pause | <: prev | >: next | q: quit'), 'bold')
-
-        pile = urwid.Pile([
+        self._info_pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
             row_title,
             row_artist,
@@ -157,12 +199,55 @@ class VolumitoV1:
             urwid.Divider(),
             self.last_key,
         ])
-        filler = urwid.Filler(pile, valign='top')
-        return filler
+
+        # Playlist pane (initially empty)
+        self._queue_walker = urwid.SimpleListWalker([urwid.Text(' No queue')])
+        self._queue_listbox = urwid.ListBox(self._queue_walker)
+        queue_box = urwid.LineBox(self._queue_listbox, title='Playlist')
+
+        # Start with just the info pane; playlist added dynamically
+        self._columns = urwid.Columns([('weight', 1, urwid.Filler(self._info_pile, valign='top'))])
+        self._queue_box = queue_box
+        self._playlist_visible = False
+
+        return self._columns
+
+    def _update_queue_pane(self, queue, current_index):
+        """Rebuild the queue walker contents and show/hide the pane as needed."""
+        show = len(queue) > 1
+
+        if show:
+            items = [
+                self._make_queue_item(track, i, current_index)
+                for i, track in enumerate(queue)
+            ]
+            self._queue_walker[:] = items
+            # scroll so current track is visible
+            if 0 <= current_index < len(items):
+                self._queue_walker.set_focus(current_index)
+        else:
+            self._queue_walker[:] = [urwid.Text(' No queue')]
+
+        if show and not self._playlist_visible:
+            # Add playlist column
+            self._columns.contents = [
+                (urwid.Filler(self._info_pile, valign='top'), self._columns.options('weight', 1)),
+                (self._queue_box, self._columns.options('weight', 1)),
+            ]
+            self._playlist_visible = True
+        elif not show and self._playlist_visible:
+            # Remove playlist column
+            self._columns.contents = [
+                (urwid.Filler(self._info_pile, valign='top'), self._columns.options('weight', 1)),
+            ]
+            self._playlist_visible = False
 
     def refresh_ui(self, loop=None, user_data=None):
         with self._status_lock:
             s = dict(self.status)
+        with self._queue_lock:
+            queue = list(self.queue)
+
         title = s.get('title', '-')
         artist = s.get('artist', '-')
         album = s.get('album', '-')
@@ -331,6 +416,26 @@ class VolumitoV1:
                 self.length_value.set_text('--:--')
             except Exception:
                 pass
+
+        # Update playlist pane
+        # Determine current queue index from status
+        current_index = s.get('position', None)
+        if current_index is None:
+            # Try to match by title
+            current_title = s.get('title', '')
+            current_index = next(
+                (i for i, t in enumerate(queue) if t.get('title') == current_title),
+                0
+            )
+        try:
+            current_index = int(current_index)
+        except Exception:
+            current_index = 0
+
+        try:
+            self._update_queue_pane(queue, current_index)
+        except Exception:
+            pass
 
         # schedule next refresh
         if self.loop:
@@ -562,12 +667,14 @@ class VolumitoV1:
         # build UI
         top = self.build_ui()
         palette = [
-            ('header', 'bold', 'dark gray'),
-            ('highlight', 'standout', 'default'),
-            ('normal', 'default', 'default'),
-            ('bold', 'bold', 'dark gray'),
-            ('pg normal', 'default', 'dark gray'),
-            ('pg complete', 'white', 'black'),
+            ('header',        'bold',    'dark gray'),
+            ('highlight',     'standout', 'default'),
+            ('normal',        'default', 'default'),
+            ('bold',          'bold',    'dark gray'),
+            ('pg normal',     'default', 'dark gray'),
+            ('pg complete',   'white',   'black'),
+            ('queue_item',    'default', 'default'),
+            ('queue_current', 'black',   'light cyan'),
         ]
         self.loop = urwid.MainLoop(top, palette, unhandled_input=self.unhandled_input)
         # start periodic UI refresh
