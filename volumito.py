@@ -274,7 +274,7 @@ class VolumitoV1:
         self.artist_value.set_text(artist)
         self.album_value.set_text(album)
         self.state_value.set_text(state)
-        self.shuffle_value.set_text('On' if shuffle else 'Off')
+        self.shuffle_value.set_text('on' if shuffle else 'off')
         self.bitrate_value.set_text(display_rate)
         # update volume text
         try:
