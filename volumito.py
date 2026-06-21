@@ -183,7 +183,7 @@ class VolumitoV1:
             urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | t: toggle queue | q: quit'), 'bold')
+        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | u: toggle queue | q: quit'), 'bold')
 
         self._info_pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
@@ -463,7 +463,7 @@ class VolumitoV1:
             raise urwid.ExitMainLoop()
 
         # toggle queue pane visibility
-        if klower == 't':
+        if klower == 'u':
             self._queue_force_hidden = not self._queue_force_hidden
             # force an immediate queue pane update using current state
             with self._queue_lock:
