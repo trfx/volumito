@@ -130,6 +130,8 @@ class VolumitoV1:
         self.album_value = urwid.Text('?', wrap='clip')
         self.state_label = urwid.Text('Playback State: ')
         self.state_value = urwid.Text('?', wrap='clip')
+        self.shuffle_label = urwid.Text('Shuffle: ')
+        self.shuffle_value = urwid.Text('?', wrap='clip')
         self.bitrate_label = urwid.Text('Sample Rate: ')
         self.bitrate_value = urwid.Text('?', wrap='clip')
         self.elapsed_label = urwid.Text('Elapsed: ')
@@ -161,6 +163,10 @@ class VolumitoV1:
             ('fixed', 16, self.state_label),
             urwid.AttrMap(self.state_value, 'normal')
         ])
+        row_shuffle = urwid.Columns([
+            ('fixed', 16, self.shuffle_label),
+            urwid.AttrMap(self.shuffle_value, 'normal')
+        ])
         row_bitrate = urwid.Columns([
             ('fixed', 16, self.bitrate_label),
             urwid.AttrMap(self.bitrate_value, 'normal')
@@ -183,7 +189,7 @@ class VolumitoV1:
             urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | u: toggle queue | q: quit'), 'bold')
+        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | s: shuffle | u: toggle queue | q: quit'), 'bold')
 
         self._info_pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
@@ -191,6 +197,7 @@ class VolumitoV1:
             row_artist,
             row_album,
             row_state,
+            row_shuffle,
             row_bitrate,
             row_elapsed,
             row_length,
@@ -261,11 +268,13 @@ class VolumitoV1:
         display_rate = samplerate if samplerate is not None else bitrate
         display_rate = '-' if display_rate is None else str(display_rate)
         vol = s.get('volume', '-')
+        shuffle = s.get('random', False)
 
         self.title_value.set_text(title)
         self.artist_value.set_text(artist)
         self.album_value.set_text(album)
         self.state_value.set_text(state)
+        self.shuffle_value.set_text('On' if shuffle else 'Off')
         self.bitrate_value.set_text(display_rate)
         # update volume text
         try:
@@ -494,6 +503,11 @@ class VolumitoV1:
             self._toggle_play()
             return
 
+        # shuffle
+        if klower in ('s',):
+            self._toggle_shuffle()
+            return
+
         # previous: accept comma, '<', left arrow names and common variants
         if kstr in (',', '<') or klower in ('left', 'key_left') or (isinstance(key, tuple) and 'left' in str(key).lower()):
             self._send_cmd('prev')
@@ -536,6 +550,16 @@ class VolumitoV1:
         with self._status_lock:
             self.status['status'] = new_state
         url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=" + cmd
+        threading.Thread(target=lambda: self._safe_get(url), daemon=True).start()
+
+    def _toggle_shuffle(self):
+        with self._status_lock:
+            cur = bool(self.status.get('random', False))
+        new_state = not cur
+        with self._status_lock:
+            self.status['random'] = new_state
+            self.status['shuffle'] = new_state  # keep shuffle in sync for UI display
+        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=random"
         threading.Thread(target=lambda: self._safe_get(url), daemon=True).start()
 
     def _send_cmd(self, cmd):
