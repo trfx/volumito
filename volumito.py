@@ -41,6 +41,8 @@ class VolumitoV1:
         # columns widget reference so we can show/hide playlist pane
         self._columns = None
         self._playlist_visible = False
+        # user-controlled toggle: when True, hide queue pane regardless of queue size
+        self._queue_force_hidden = False
 
     def check_config(self, config_dir="~/.config/volumito/"):
         config_dir = os.path.expanduser(config_dir)
@@ -181,7 +183,7 @@ class VolumitoV1:
             urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | q: quit'), 'bold')
+        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | t: toggle queue | q: quit'), 'bold')
 
         self._info_pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
@@ -214,7 +216,8 @@ class VolumitoV1:
 
     def _update_queue_pane(self, queue, current_index):
         """Rebuild the queue walker contents and show/hide the pane as needed."""
-        show = len(queue) > 1
+        # Respect user toggle: never show if force-hidden
+        show = len(queue) > 1 and not self._queue_force_hidden
 
         if show:
             items = [
@@ -458,6 +461,25 @@ class VolumitoV1:
         # quit
         if klower == 'q':
             raise urwid.ExitMainLoop()
+
+        # toggle queue pane visibility
+        if klower == 't':
+            self._queue_force_hidden = not self._queue_force_hidden
+            # force an immediate queue pane update using current state
+            with self._queue_lock:
+                queue = list(self.queue)
+            with self._status_lock:
+                s = dict(self.status)
+            current_index = s.get('position', 0)
+            try:
+                current_index = int(current_index)
+            except Exception:
+                current_index = 0
+            try:
+                self._update_queue_pane(queue, current_index)
+            except Exception:
+                pass
+            return
 
         # volume
         if kstr in ('+', '=', 'plus') or klower in ('+', '=', 'plus'):
