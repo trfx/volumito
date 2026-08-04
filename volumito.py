@@ -18,9 +18,33 @@ import os
 import sys
 import threading
 import time
-import yaml
-import requests
-import urwid
+
+try:
+    import yaml
+except ImportError:
+    print("PyYAML is not installed. Please install it with: pip install pyyaml")
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("requests is not installed. Please install it with: pip install requests")
+    sys.exit(1)
+
+try:
+    import urwid
+except ImportError:
+    print("urwid is not installed. Please install it with: pip install urwid")
+    sys.exit(1)
+
+
+def _safe_str(v, fallback='-'):
+    """Return str(v) unless v is None or empty, in which case return fallback."""
+    if v is None:
+        return fallback
+    s = str(v)
+    return s if s.strip() else fallback
+
 
 class VolumitoV1:
     def __init__(self):
@@ -109,8 +133,8 @@ class VolumitoV1:
 
     def _make_queue_item(self, track, index, current_index):
         """Build a urwid Text widget for a single queue entry."""
-        title = track.get("title") or track.get("name") or "Unknown"
-        artist = track.get("artist") or ""
+        title = _safe_str(track.get("title") or track.get("name"), "Unknown")
+        artist = _safe_str(track.get("artist"), "")
         label = f" {index + 1:>3}. {title}"
         if artist:
             label += f"  [{artist}]"
@@ -141,7 +165,7 @@ class VolumitoV1:
         self.volume_label = urwid.Text('Volume: ')
         self.volume_text = urwid.Text('--')
         self.server_label = urwid.Text('Server: ')
-        self.server_text = urwid.Text(self.config.get("volumio_host", "-"))
+        self.server_text = urwid.Text(_safe_str(self.config.get("volumio_host"), "-"))
         self.last_key = urwid.Text('')
         # progress bar for visual track progress
         self.progress = urwid.ProgressBar('pg normal', 'pg complete', 0, 100)
@@ -258,16 +282,16 @@ class VolumitoV1:
         with self._queue_lock:
             queue = list(self.queue)
 
-        title = s.get('title', '-')
-        artist = s.get('artist', '-')
-        album = s.get('album', '-')
-        state = s.get('status', '-')
+        title = _safe_str(s.get('title'))
+        artist = _safe_str(s.get('artist'))
+        album = _safe_str(s.get('album'))
+        state = _safe_str(s.get('status'))
         samplerate = s.get('samplerate')
         bitrate = s.get('bitrate')
         # Prefer samplerate, fall back to bitrate, then to '-'
         display_rate = samplerate if samplerate is not None else bitrate
-        display_rate = '-' if display_rate is None else str(display_rate)
-        vol = s.get('volume', '-')
+        display_rate = _safe_str(display_rate)
+        vol = s.get('volume')
         shuffle = s.get('random', False)
 
         self.title_value.set_text(title)
@@ -276,6 +300,7 @@ class VolumitoV1:
         self.state_value.set_text(state)
         self.shuffle_value.set_text('on' if shuffle else 'off')
         self.bitrate_value.set_text(display_rate)
+
         # update volume text
         try:
             vnum = int(vol) if vol is not None else 0
@@ -284,7 +309,7 @@ class VolumitoV1:
                 vnum = int(float(vol))
             except Exception:
                 vnum = 0
-        self.volume_text.set_text(f"{vnum}")
+        self.volume_text.set_text(str(vnum))
 
         # update progress bar
         def _parse_time(v):
@@ -434,7 +459,7 @@ class VolumitoV1:
         current_index = s.get('position', None)
         if current_index is None:
             # Try to match by title
-            current_title = s.get('title', '')
+            current_title = _safe_str(s.get('title'), '')
             current_index = next(
                 (i for i, t in enumerate(queue) if t.get('title') == current_title),
                 0
