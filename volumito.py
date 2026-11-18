@@ -826,6 +826,7 @@ class VolumitoV1:
             (index for index, track in enumerate(siblings) if track is item or track == item),
             0,
         )
+        ordered_tracks = siblings[selected_index:] + siblings[:selected_index]
         url = self._api_url("replaceAndPlay")
         if not url:
             self._music_menu_error = "No Volumio server selected."
@@ -834,7 +835,7 @@ class VolumitoV1:
         try:
             response = self.session.post(
                 url,
-                json={"list": siblings, "index": selected_index},
+                json={"list": ordered_tracks, "index": 0},
                 timeout=5,
             )
             response.raise_for_status()

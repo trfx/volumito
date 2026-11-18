@@ -240,7 +240,7 @@ def test_music_menu_browses_folders_and_plays_selected_track(monkeypatch, tmp_pa
     ]
     assert play_requests == [(
         "http://192.168.1.23/api/v1/replaceAndPlay",
-        {"list": [first_track, second_track], "index": 1},
+        {"list": [second_track, first_track], "index": 0},
     )]
     assert not app._music_menu_open
     assert app.loop.widget is app._main_widget
