@@ -125,7 +125,8 @@ class VolumitoV1:
         # playlist walker/listbox references (built in build_ui)
         self._queue_walker = None
         self._queue_listbox = None
-        self._selected_queue_index = None
+        self._queue_rows = []
+        self._queue_snapshot = None
         # columns widget reference so we can show/hide playlist pane
         self._columns = None
         self._playlist_visible = False
@@ -133,6 +134,8 @@ class VolumitoV1:
         self._music_menu_open = False
         self._music_pages = []
         self._music_menu_error = None
+        self._music_menu_walker = None
+        self._music_menu_items = []
         # user-controlled toggle: when True, hide queue pane regardless of queue size
         self._queue_force_hidden = False
 
@@ -223,18 +226,19 @@ class VolumitoV1:
             time.sleep(1)
 
     def _make_queue_item(self, track, index, current_index):
-        """Build a urwid Text widget for a single queue entry."""
+        """Build a selectable row for a single queue entry."""
         title = _safe_str(track.get("title") or track.get("name"), "Unknown")
         artist = _safe_str(track.get("artist"), "")
         label = f" {index + 1:>3}. {title}"
         if artist:
             label += f"  [{artist}]"
-        if index == self._selected_queue_index:
-            style = 'queue_selected_current' if index == current_index else 'queue_selected'
-            return urwid.AttrMap(urwid.Text(label, wrap='clip'), style)
-        if index == current_index:
-            return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_current')
-        return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_item')
+        style = 'queue_current' if index == current_index else 'queue_item'
+        focus_style = 'queue_selected_current' if index == current_index else 'queue_selected'
+        return urwid.AttrMap(
+            urwid.SelectableIcon(label, cursor_position=0, wrap='clip'),
+            style,
+            focus_style,
+        )
 
     def build_ui(self):
         # Widgets that will be updated
@@ -340,30 +344,42 @@ class VolumitoV1:
         return self._columns
 
     def _update_queue_pane(self, queue, current_index):
-        """Rebuild the queue walker contents and show/hide the pane as needed."""
+        """Update queue rows while preserving list focus and scroll position."""
         # Respect user toggle: never show if force-hidden
         show = len(queue) > 1 and not self._queue_force_hidden
 
-        if queue:
-            if self._selected_queue_index is None or self._selected_queue_index >= len(queue):
-                try:
-                    self._selected_queue_index = int(current_index)
-                except (TypeError, ValueError):
-                    self._selected_queue_index = 0
-                if not 0 <= self._selected_queue_index < len(queue):
-                    self._selected_queue_index = 0
-        else:
-            self._selected_queue_index = None
-
         if show:
-            items = [
-                self._make_queue_item(track, i, current_index)
-                for i, track in enumerate(queue)
-            ]
-            self._queue_walker[:] = items
-            self._queue_walker.set_focus(self._selected_queue_index)
+            snapshot = tuple(
+                (track.get("uri"), track.get("title"), track.get("name"), track.get("artist"))
+                for track in queue
+            )
+            if snapshot != self._queue_snapshot:
+                focus_position = self._queue_walker.focus
+                self._queue_rows = [
+                    self._make_queue_item(track, i, current_index)
+                    for i, track in enumerate(queue)
+                ]
+                self._queue_walker[:] = self._queue_rows
+                if self._queue_snapshot is None:
+                    try:
+                        focus_position = int(current_index)
+                    except (TypeError, ValueError):
+                        focus_position = 0
+                if not 0 <= focus_position < len(self._queue_rows):
+                    focus_position = 0
+                self._queue_walker.set_focus(focus_position)
+                self._queue_snapshot = snapshot
+
+            for index, row in enumerate(self._queue_rows):
+                current = index == current_index
+                row.set_attr_map({None: 'queue_current' if current else 'queue_item'})
+                row.set_focus_map({
+                    None: 'queue_selected_current' if current else 'queue_selected'
+                })
         else:
             self._queue_walker[:] = [urwid.Text(' No queue')]
+            self._queue_rows = []
+            self._queue_snapshot = None
 
         if show and not self._playlist_visible:
             # Add playlist column
@@ -372,6 +388,7 @@ class VolumitoV1:
                 (self._queue_box, self._columns.options('weight', 1)),
             ]
             self._playlist_visible = True
+            self._columns.focus_position = 1
         elif not show and self._playlist_visible:
             # Remove playlist column
             self._columns.contents = [
@@ -606,6 +623,10 @@ class VolumitoV1:
         if klower == 'q':
             raise urwid.ExitMainLoop()
 
+        if self._music_menu_open and klower in ('enter', 'return'):
+            self._activate_music_menu_item()
+            return
+
         if self.loop and self.loop.widget is not self._main_widget:
             return
 
@@ -616,12 +637,6 @@ class VolumitoV1:
             self._open_music_menu()
             return
 
-        if klower in ('up', 'key_up'):
-            self._navigate_queue(-1)
-            return
-        if klower in ('down', 'key_down'):
-            self._navigate_queue(1)
-            return
         if klower in ('enter', 'return'):
             self._play_selected_queue_track()
             return
@@ -765,30 +780,60 @@ class VolumitoV1:
             self._render_music_menu()
             return
 
-        self._music_pages.append({"uri": uri, "title": title, "items": items})
+        self._music_pages.append({
+            "uri": uri,
+            "title": title,
+            "items": items,
+            "focus_index": None,
+        })
         self._music_menu_error = None
         self._render_music_menu()
 
+    def _make_music_menu_row(self, label):
+        return urwid.AttrMap(
+            urwid.SelectableIcon(label, cursor_position=0, wrap="clip"),
+            "queue_item",
+            "queue_selected",
+        )
+
+    @staticmethod
+    def _is_playable_music_item(item):
+        item_type = str(item.get("type", "")).lower()
+        return item_type in ("song", "track", "webradio") or bool(item.get("trackType"))
+
     def _render_music_menu(self):
         page = self._music_pages[-1] if self._music_pages else {"title": "Music", "items": []}
-        choices = []
+        rows = []
+        self._music_menu_items = []
+        back_offset = 0
+        if len(self._music_pages) > 1:
+            rows.append(self._make_music_menu_row("< Back"))
+            self._music_menu_items.append(None)
+            back_offset = 1
+
         for item in page["items"]:
             label = _safe_str(item.get("title") or item.get("name"), "Unknown")
-            button = urwid.Button(label)
-            urwid.connect_signal(
-                button,
-                "click",
-                self._select_music_item,
-                user_args=(item,),
-            )
-            choices.append(button)
-        if not choices:
-            choices.append(urwid.Text("No items found."))
+            if item.get("uri") and not self._is_playable_music_item(item):
+                label += " >"
+            rows.append(self._make_music_menu_row(label))
+            self._music_menu_items.append(item)
+        if not rows:
+            rows.append(urwid.Text("No items found."))
         if self._music_menu_error:
-            choices.append(urwid.Text(self._music_menu_error, wrap="any"))
+            rows.append(urwid.Text(self._music_menu_error, wrap="any"))
+
+        walker = urwid.SimpleListWalker(rows)
+        focus_index = page.get("focus_index")
+        if focus_index is None:
+            focus_index = back_offset
+        else:
+            focus_index += back_offset
+        if 0 <= focus_index < len(rows) and rows[focus_index].selectable():
+            walker.set_focus(focus_index)
+        self._music_menu_walker = walker
 
         menu = urwid.LineBox(
-            urwid.ListBox(urwid.SimpleFocusListWalker(choices)),
+            urwid.ListBox(walker),
             title=page["title"],
         )
         self.loop.widget = urwid.Overlay(
@@ -800,9 +845,22 @@ class VolumitoV1:
             height=("relative", 70),
         )
 
+    def _activate_music_menu_item(self):
+        if not self._music_menu_walker:
+            return
+        index = self._music_menu_walker.focus
+        if index >= len(self._music_menu_items):
+            return
+        item = self._music_menu_items[index]
+        if item is None:
+            self._music_menu_back()
+            return
+        if self._music_pages:
+            self._music_pages[-1]["focus_index"] = index - (1 if len(self._music_pages) > 1 else 0)
+        self._select_music_item(item)
+
     def _select_music_item(self, item, button=None):
-        item_type = str(item.get("type", "")).lower()
-        if item_type in ("song", "track", "webradio") or item.get("trackType"):
+        if self._is_playable_music_item(item):
             self._play_music_item(item)
             return
         uri = item.get("uri")
@@ -817,8 +875,7 @@ class VolumitoV1:
         page = self._music_pages[-1] if self._music_pages else {}
         siblings = [
             track for track in page.get("items", [])
-            if str(track.get("type", "")).lower() in ("song", "track", "webradio")
-            or track.get("trackType")
+            if self._is_playable_music_item(track)
         ]
         if not siblings:
             siblings = [item]
@@ -862,34 +919,15 @@ class VolumitoV1:
         self._music_menu_error = None
         self.loop.widget = self._main_widget
 
-    def _navigate_queue(self, direction):
+    def _play_selected_queue_track(self):
         if not self._playlist_visible:
             return
         with self._queue_lock:
-            queue = list(self.queue)
-        if not queue:
-            return
-
-        selected = self._selected_queue_index
-        if selected is None:
-            selected = 0
-        self._selected_queue_index = max(0, min(len(queue) - 1, selected + direction))
-        with self._status_lock:
-            current_index = self.status.get('position', 0)
-        try:
-            current_index = int(current_index)
-        except (TypeError, ValueError):
-            current_index = 0
-        self._update_queue_pane(queue, current_index)
-
-    def _play_selected_queue_track(self):
-        if not self._playlist_visible or self._selected_queue_index is None:
-            return
-        with self._queue_lock:
             queue_length = len(self.queue)
-        if self._selected_queue_index >= queue_length:
+        selected_index = self._queue_walker.focus
+        if selected_index >= queue_length:
             return
-        self._send_cmd("play", f"N={self._selected_queue_index}")
+        self._send_cmd("play", f"N={selected_index}")
 
     def _change_volume(self, delta):
         url = self._api_url("commands/?cmd=volume&volume=")

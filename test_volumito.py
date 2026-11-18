@@ -119,12 +119,15 @@ def test_playlist_navigation_and_enter_play_selected_track(monkeypatch, tmp_path
         lambda command, query=None: commands.append((command, query)),
     )
 
-    app.unhandled_input("up")
-    assert app._selected_queue_index == 0
-    app.unhandled_input("down")
-    app.unhandled_input("down")
-    app.unhandled_input("down")
-    assert app._selected_queue_index == 2
+    app._columns.keypress((100, 24), "up")
+    assert app._queue_walker.focus == 0
+    app._columns.keypress((100, 24), "down")
+    app._columns.keypress((100, 24), "down")
+    app._columns.keypress((100, 24), "down")
+    assert app._queue_walker.focus == 2
+
+    app._update_queue_pane(app.queue, 1)
+    assert app._queue_walker.focus == 2
     app.unhandled_input("enter")
 
     assert commands == [("play", "N=2")]
@@ -222,15 +225,18 @@ def test_music_menu_browses_folders_and_plays_selected_track(monkeypatch, tmp_pa
 
     app.unhandled_input("m")
     assert app._music_pages[-1]["title"] == "Music"
-    app._select_music_item(library)
+    assert app._music_menu_walker[0].selectable()
+    app.unhandled_input("enter")
     assert app._music_pages[-1]["title"] == "Music Library"
-    app._select_music_item(album)
+    assert app._music_menu_items == [None, album]
+    app.unhandled_input("enter")
     assert app._music_pages[-1]["title"] == "Albums"
 
     app.unhandled_input("esc")
     assert app._music_pages[-1]["title"] == "Music Library"
-    app._select_music_item(album)
-    app._select_music_item(second_track)
+    app.unhandled_input("enter")
+    app._music_menu_walker.set_focus(2)
+    app.unhandled_input("enter")
 
     assert browse_requests == [
         ("http://192.168.1.23/api/v1/browse", None),
