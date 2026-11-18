@@ -166,3 +166,81 @@ def test_seek_sends_one_documented_position_and_preserves_queue_index(monkeypatc
     ]
     assert app.status["seek"] == 90000
     assert app.status["position"] == 2
+
+
+def test_music_menu_browses_folders_and_plays_selected_track(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    library = {"name": "Music Library", "uri": "music-library"}
+    album = {"name": "Albums", "uri": "albums", "type": "folder"}
+    first_track = {
+        "title": "First track",
+        "uri": "music-library/albums/first.flac",
+        "service": "mpd",
+        "type": "song",
+    }
+    second_track = {
+        "title": "Second track",
+        "uri": "music-library/albums/second.flac",
+        "service": "mpd",
+        "type": "song",
+    }
+    browse_results = {
+        None: {"navigation": {"lists": [library]}},
+        "music-library": {"navigation": {"lists": [{"items": [album]}]}},
+        "albums": {"navigation": {"lists": [{"items": [first_track, second_track]}]}},
+    }
+    browse_requests = []
+    play_requests = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, data):
+            self.data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.data
+
+    class Session:
+        def get(self, url, params=None, timeout=None):
+            uri = params.get("uri") if params else None
+            browse_requests.append((url, uri))
+            return Response(browse_results[uri])
+
+        def post(self, url, json, timeout=None):
+            play_requests.append((url, json))
+            return Response({"response": "success"})
+
+    app.session = Session()
+
+    app.unhandled_input("m")
+    assert app._music_pages[-1]["title"] == "Music"
+    app._select_music_item(library)
+    assert app._music_pages[-1]["title"] == "Music Library"
+    app._select_music_item(album)
+    assert app._music_pages[-1]["title"] == "Albums"
+
+    app.unhandled_input("esc")
+    assert app._music_pages[-1]["title"] == "Music Library"
+    app._select_music_item(album)
+    app._select_music_item(second_track)
+
+    assert browse_requests == [
+        ("http://192.168.1.23/api/v1/browse", None),
+        ("http://192.168.1.23/api/v1/browse", "music-library"),
+        ("http://192.168.1.23/api/v1/browse", "albums"),
+        ("http://192.168.1.23/api/v1/browse", "albums"),
+    ]
+    assert play_requests == [(
+        "http://192.168.1.23/api/v1/replaceAndPlay",
+        {"list": [first_track, second_track], "index": 1},
+    )]
+    assert not app._music_menu_open
+    assert app.loop.widget is app._main_widget

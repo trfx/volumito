@@ -130,6 +130,9 @@ class VolumitoV1:
         self._columns = None
         self._playlist_visible = False
         self._main_widget = None
+        self._music_menu_open = False
+        self._music_pages = []
+        self._music_menu_error = None
         # user-controlled toggle: when True, hide queue pane regardless of queue size
         self._queue_force_hidden = False
 
@@ -258,7 +261,7 @@ class VolumitoV1:
         self.server_text = urwid.Text(_safe_str(self.config.get("volumio_host"), "Not found"))
         self.last_key = urwid.Text('')
         # progress bar for visual track progress
-        self.progress = urwid.ProgressBar('pg normal', 'pg complete', 0, 100)
+        self.progress = urwid.ProgressBar('pg normal', 'highlight', 0, 100)
 
         # Rows with colored value using palette entry 'title'
         row_title = urwid.Columns([
@@ -593,18 +596,24 @@ class VolumitoV1:
         klower = kstr.lower()
 
         if klower in ('esc', 'escape') and self._main_widget:
-            self.loop.widget = self._main_widget
+            if self._music_menu_open:
+                self._music_menu_back()
+            else:
+                self.loop.widget = self._main_widget
             return
 
         # quit
         if klower == 'q':
             raise urwid.ExitMainLoop()
 
+        if self.loop and self.loop.widget is not self._main_widget:
+            return
+
         if klower == 'h':
             self._show_host_picker()
             return
-
-        if self.loop and self.loop.widget is not self._main_widget:
+        if klower == 'm':
+            self._open_music_menu()
             return
 
         if klower in ('up', 'key_up'):
@@ -716,6 +725,141 @@ class VolumitoV1:
         with self._queue_lock:
             self.queue.clear()
         self._close_host_picker()
+
+    def _open_music_menu(self):
+        self._music_menu_open = True
+        self._music_pages = []
+        self._music_menu_error = None
+        self._load_music_page(None, "Music")
+
+    def _load_music_page(self, uri, title):
+        url = self._api_url("browse")
+        if not url:
+            self._music_menu_error = "No Volumio server selected."
+            self._render_music_menu()
+            return
+        try:
+            response = self.session.get(
+                url,
+                params={"uri": uri} if uri else None,
+                timeout=3,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("navigation"), dict):
+                raise ValueError("Volumio returned an invalid browse response.")
+            sections = data["navigation"].get("lists", [])
+            if not isinstance(sections, list):
+                raise ValueError("Volumio returned an invalid browse list.")
+            items = []
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                section_items = section.get("items")
+                if isinstance(section_items, list):
+                    items.extend(item for item in section_items if isinstance(item, dict))
+                elif section.get("uri"):
+                    items.append(section)
+        except (requests.RequestException, ValueError) as error:
+            self._music_menu_error = f"Could not load {title}: {error}"
+            self._render_music_menu()
+            return
+
+        self._music_pages.append({"uri": uri, "title": title, "items": items})
+        self._music_menu_error = None
+        self._render_music_menu()
+
+    def _render_music_menu(self):
+        page = self._music_pages[-1] if self._music_pages else {"title": "Music", "items": []}
+        choices = []
+        for item in page["items"]:
+            label = _safe_str(item.get("title") or item.get("name"), "Unknown")
+            button = urwid.Button(label)
+            urwid.connect_signal(
+                button,
+                "click",
+                self._select_music_item,
+                user_args=(item,),
+            )
+            choices.append(button)
+        if not choices:
+            choices.append(urwid.Text("No items found."))
+        if self._music_menu_error:
+            choices.append(urwid.Text(self._music_menu_error, wrap="any"))
+
+        menu = urwid.LineBox(
+            urwid.ListBox(urwid.SimpleFocusListWalker(choices)),
+            title=page["title"],
+        )
+        self.loop.widget = urwid.Overlay(
+            menu,
+            self._main_widget,
+            align="center",
+            width=("relative", 75),
+            valign="middle",
+            height=("relative", 70),
+        )
+
+    def _select_music_item(self, item, button=None):
+        item_type = str(item.get("type", "")).lower()
+        if item_type in ("song", "track", "webradio") or item.get("trackType"):
+            self._play_music_item(item)
+            return
+        uri = item.get("uri")
+        if not uri:
+            self._music_menu_error = "This menu item cannot be opened."
+            self._render_music_menu()
+            return
+        title = _safe_str(item.get("title") or item.get("name"), "Music")
+        self._load_music_page(uri, title)
+
+    def _play_music_item(self, item):
+        page = self._music_pages[-1] if self._music_pages else {}
+        siblings = [
+            track for track in page.get("items", [])
+            if str(track.get("type", "")).lower() in ("song", "track", "webradio")
+            or track.get("trackType")
+        ]
+        if not siblings:
+            siblings = [item]
+        selected_index = next(
+            (index for index, track in enumerate(siblings) if track is item or track == item),
+            0,
+        )
+        url = self._api_url("replaceAndPlay")
+        if not url:
+            self._music_menu_error = "No Volumio server selected."
+            self._render_music_menu()
+            return
+        try:
+            response = self.session.post(
+                url,
+                json={"list": siblings, "index": selected_index},
+                timeout=5,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, dict) and (result.get("Error") or result.get("error")):
+                raise RuntimeError(result.get("Error") or result.get("error"))
+        except (requests.RequestException, ValueError, RuntimeError) as error:
+            self._music_menu_error = f"Could not play track: {error}"
+            self._render_music_menu()
+            return
+
+        self._music_menu_open = False
+        self._music_pages = []
+        self.loop.widget = self._main_widget
+
+    def _music_menu_back(self):
+        if len(self._music_pages) > 1:
+            self._music_pages.pop()
+            self._music_menu_error = None
+            self._render_music_menu()
+            return
+        self._music_menu_open = False
+        self._music_pages = []
+        self._music_menu_error = None
+        self.loop.widget = self._main_widget
 
     def _navigate_queue(self, direction):
         if not self._playlist_visible:
@@ -942,7 +1086,6 @@ class VolumitoV1:
             ('normal',        'default', 'default'),
             ('bold',          'bold',    'dark gray'),
             ('pg normal',     'default', 'dark gray'),
-            ('pg complete',   'white',   'black'),
             ('queue_item',    'default', 'default'),
             ('queue_current', 'black',   'light cyan'),
             ('queue_selected', 'black', 'light green'),
