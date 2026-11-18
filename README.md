@@ -7,10 +7,17 @@ A TUI remote controller for Volumio
    - Volumio (tested with v4+)
 
 ## Install
-After cloning this repository execute the below:
-```python -m venv venv
+After cloning this repository execute the below. On startup, Volumito discovers
+Volumio units advertised on the local network and connects to the first one it
+finds. Press `h` to choose another discovered unit. A `~/.config/volumito/config.yaml`
+is created or updated with the selected host and reused on later starts. Use
+`u` to show or hide the playlist, `up` and `down` to select a track, `Enter` to
+play it, and `[` or `]` to seek backward or forward 30 seconds.
+```bash
+python -m venv venv
 source venv/bin/activate
-python volumito.py # at the initial run it will create a configuration file in $HOME/.config. Edit if necessary and run again!
+pip install -r requirements.txt
+python volumito.py
 ```
 
 ## Screenshots

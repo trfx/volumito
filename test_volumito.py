@@ -1,0 +1,168 @@
+import urwid
+
+import volumito
+
+
+def test_missing_config_does_not_create_config_directory(tmp_path):
+    config_dir = tmp_path / "volumito"
+    app = object.__new__(volumito.VolumitoV1)
+
+    assert app.check_config(config_dir=str(config_dir)) == {}
+    assert not config_dir.exists()
+
+
+def test_discovery_uses_volumio_mdns_service(monkeypatch):
+    class FakeInfo:
+        port = 8080
+
+        def parsed_addresses(self):
+            return ["192.168.1.23", "fe80::1"]
+
+    class FakeZeroconf:
+        def get_service_info(self, service_type, name, timeout):
+            assert service_type == volumito.VOLUMIO_SERVICE
+            return FakeInfo()
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def __init__(self, zeroconf, service_type, listener):
+            listener.add_service(
+                zeroconf,
+                service_type,
+                "Living Room._Volumio._tcp.local.",
+            )
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(volumito, "Zeroconf", FakeZeroconf)
+    monkeypatch.setattr(volumito, "ServiceBrowser", FakeBrowser)
+    monkeypatch.setattr(volumito.time, "sleep", lambda timeout: None)
+
+    assert volumito.discover_volumio_devices() == [{
+        "name": "Living Room",
+        "host": "192.168.1.23",
+        "port": 8080,
+    }]
+
+
+def test_configless_start_selects_first_discovered_server(monkeypatch, tmp_path):
+    devices = [
+        {"name": "Living Room", "host": "192.168.1.23", "port": 8080},
+        {"name": "Kitchen", "host": "192.168.1.24", "port": 80},
+    ]
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: devices)
+
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+
+    assert app.config["volumio_host"] == "192.168.1.23"
+    assert app._api_url("getState") == "http://192.168.1.23:8080/api/v1/getState"
+    assert app.discovered_devices == devices
+    assert app.check_config() == {
+        "volumio_host": "192.168.1.23",
+        "volumio_port": 8080,
+    }
+
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    app._show_host_picker()
+    assert isinstance(app.loop.widget, urwid.Overlay)
+
+    button = urwid.Button("Kitchen")
+    urwid.connect_signal(
+        button,
+        "click",
+        app._select_server,
+        user_args=(devices[1],),
+    )
+    urwid.emit_signal(button, "click")
+
+    assert app.config["volumio_host"] == "192.168.1.24"
+    assert app.server_text.get_text()[0] == "192.168.1.24"
+    assert app._api_url("getState") == "http://192.168.1.24/api/v1/getState"
+    assert app.loop.widget is app._main_widget
+    assert app.check_config() == {
+        "volumio_host": "192.168.1.24",
+        "volumio_port": 80,
+    }
+
+
+def test_configless_start_without_discovery_stays_idle(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+
+    assert app.read_status() == {}
+    assert app.read_queue() == []
+    assert app._api_url("getState") is None
+    app._change_volume(2)
+    app._toggle_play()
+    app._toggle_shuffle()
+    app._send_cmd("next")
+    app._seek_relative(30)
+
+
+def test_playlist_navigation_and_enter_play_selected_track(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    app.queue = [{"title": "First"}, {"title": "Second"}, {"title": "Third"}]
+    app.status = {"position": 1}
+    app._update_queue_pane(app.queue, 1)
+    commands = []
+    monkeypatch.setattr(
+        app,
+        "_send_cmd",
+        lambda command, query=None: commands.append((command, query)),
+    )
+
+    app.unhandled_input("up")
+    assert app._selected_queue_index == 0
+    app.unhandled_input("down")
+    app.unhandled_input("down")
+    app.unhandled_input("down")
+    assert app._selected_queue_index == 2
+    app.unhandled_input("enter")
+
+    assert commands == [("play", "N=2")]
+
+
+def test_seek_sends_one_documented_position_and_preserves_queue_index(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.status = {"seek": 120000, "duration": 600, "position": 2}
+    requests = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"seek": 90000, "duration": 600, "position": 2}
+
+    class Session:
+        def get(self, url, timeout):
+            requests.append(url)
+            return Response()
+
+    class InlineThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    app.session = Session()
+    monkeypatch.setattr(volumito.threading, "Thread", InlineThread)
+
+    app._seek_relative(-30)
+
+    assert requests == [
+        "http://192.168.1.23/api/v1/commands/?cmd=seek&position=90",
+        "http://192.168.1.23/api/v1/getState",
+    ]
+    assert app.status["seek"] == 90000
+    assert app.status["position"] == 2

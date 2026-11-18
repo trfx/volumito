@@ -37,6 +37,15 @@ except ImportError:
     print("urwid is not installed. Please install it with: pip install urwid")
     sys.exit(1)
 
+try:
+    from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+except ImportError:
+    print("zeroconf is not installed. Please install it with: pip install zeroconf")
+    sys.exit(1)
+
+
+VOLUMIO_SERVICE = "_Volumio._tcp.local."
+
 
 def _safe_str(v, fallback='-'):
     """Return str(v) unless v is None or empty, in which case return fallback."""
@@ -46,9 +55,63 @@ def _safe_str(v, fallback='-'):
     return s if s.strip() else fallback
 
 
+def discover_volumio_devices(timeout=2):
+    """Return Volumio devices advertised on the local network via mDNS."""
+    devices = []
+    lock = threading.Lock()
+
+    class Listener(ServiceListener):
+        def add_service(self, zeroconf, service_type, name):
+            info = zeroconf.get_service_info(service_type, name, timeout=1000)
+            if not info:
+                return
+            addresses = info.parsed_addresses()
+            address = next(
+                (address for address in addresses if ":" not in address),
+                None,
+            )
+            if not address:
+                return
+            with lock:
+                if not any(device["name"] == name for device in devices):
+                    devices.append({
+                        "name": name.removesuffix("." + VOLUMIO_SERVICE),
+                        "host": address,
+                        "port": info.port,
+                    })
+
+        def update_service(self, zeroconf, service_type, name):
+            self.add_service(zeroconf, service_type, name)
+
+        def remove_service(self, zeroconf, service_type, name):
+            return
+
+    zeroconf = None
+    browser = None
+    try:
+        zeroconf = Zeroconf()
+        browser = ServiceBrowser(zeroconf, VOLUMIO_SERVICE, Listener())
+        time.sleep(timeout)
+    except OSError:
+        return devices
+    finally:
+        if browser is not None:
+            browser.cancel()
+        if zeroconf is not None:
+            zeroconf.close()
+    return devices
+
+
 class VolumitoV1:
-    def __init__(self):
-        self.config = self.check_config()
+    def __init__(self, config_dir="~/.config/volumito/"):
+        self.config_dir = os.path.expanduser(config_dir)
+        self.config_file = os.path.join(self.config_dir, "config.yaml")
+        self.config = self.check_config(self.config_dir)
+        self.discovered_devices = []
+        if not self.config.get("volumio_host"):
+            self.discovered_devices = discover_volumio_devices()
+            if self.discovered_devices:
+                self._set_server(self.discovered_devices[0])
         self.status = {}
         self.queue = []
         self._status_lock = threading.Lock()
@@ -62,35 +125,58 @@ class VolumitoV1:
         # playlist walker/listbox references (built in build_ui)
         self._queue_walker = None
         self._queue_listbox = None
+        self._selected_queue_index = None
         # columns widget reference so we can show/hide playlist pane
         self._columns = None
         self._playlist_visible = False
+        self._main_widget = None
         # user-controlled toggle: when True, hide queue pane regardless of queue size
         self._queue_force_hidden = False
 
-    def check_config(self, config_dir="~/.config/volumito/"):
+    def check_config(self, config_dir=None):
+        config_dir = config_dir or self.config_dir
         config_dir = os.path.expanduser(config_dir)
-        if not os.path.exists(config_dir):
-            os.makedirs(config_dir)
         config_file = os.path.join(config_dir, "config.yaml")
         if not os.path.exists(config_file):
-            with open(config_file, "w") as f:
-                f.write("volumio_host: volumio.local\n")
-            print(f"Created default config file at {config_file}. Please edit it to set your Volumio host and run again.")
-            sys.exit(0)
+            return {}
         with open(config_file, "r") as f:
             content = f.read()
-            if "volumio_host" not in content:
-                print(f"Config file at {config_file} is missing volumio_host. Please update it.")
-                sys.exit(1)
             try:
-                return yaml.safe_load(content)
+                config = yaml.safe_load(content)
             except Exception as e:
                 print(f"Error parsing config: {e}")
                 sys.exit(1)
+        if config is None:
+            return {}
+        if not isinstance(config, dict):
+            print(f"Config file at {config_file} must contain a YAML mapping.")
+            sys.exit(1)
+        return config
+
+    def _set_server(self, device):
+        self.config["volumio_host"] = device["host"]
+        self.config["volumio_port"] = device.get("port", 80)
+        os.makedirs(self.config_dir, exist_ok=True)
+        with open(self.config_file, "w") as config_file:
+            yaml.safe_dump(self.config, config_file, sort_keys=False)
+
+    def _base_url(self):
+        host = self.config.get("volumio_host")
+        if not host:
+            return None
+        port = self.config.get("volumio_port")
+        if port and int(port) != 80:
+            return f"http://{host}:{int(port)}"
+        return f"http://{host}"
+
+    def _api_url(self, path):
+        base_url = self._base_url()
+        return f"{base_url}/api/v1/{path}" if base_url else None
 
     def read_status(self):
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/getState"
+        url = self._api_url("getState")
+        if not url:
+            return {}
         try:
             r = self.session.get(url, timeout=3)
             if r.status_code != 200:
@@ -100,7 +186,9 @@ class VolumitoV1:
             return {}
 
     def read_queue(self):
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/getQueue"
+        url = self._api_url("getQueue")
+        if not url:
+            return []
         try:
             r = self.session.get(url, timeout=3)
             if r.status_code != 200:
@@ -138,10 +226,12 @@ class VolumitoV1:
         label = f" {index + 1:>3}. {title}"
         if artist:
             label += f"  [{artist}]"
+        if index == self._selected_queue_index:
+            style = 'queue_selected_current' if index == current_index else 'queue_selected'
+            return urwid.AttrMap(urwid.Text(label, wrap='clip'), style)
         if index == current_index:
             return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_current')
-        else:
-            return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_item')
+        return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_item')
 
     def build_ui(self):
         # Widgets that will be updated
@@ -165,7 +255,7 @@ class VolumitoV1:
         self.volume_label = urwid.Text('Volume: ')
         self.volume_text = urwid.Text('--')
         self.server_label = urwid.Text('Server: ')
-        self.server_text = urwid.Text(_safe_str(self.config.get("volumio_host"), "-"))
+        self.server_text = urwid.Text(_safe_str(self.config.get("volumio_host"), "Not found"))
         self.last_key = urwid.Text('')
         # progress bar for visual track progress
         self.progress = urwid.ProgressBar('pg normal', 'pg complete', 0, 100)
@@ -213,7 +303,7 @@ class VolumitoV1:
             urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        legend = urwid.AttrMap(urwid.Text('+/- vol | p: play/pause | </>: prev/next | [/]: seek -/+30s | s: shuffle | u: toggle queue | q: quit'), 'bold')
+        legend = urwid.AttrMap(urwid.Text('+/- vol | p play/pause | </> prev/next | up/down select | Enter play | [/] seek | s shuffle | u queue | h hosts | q quit'), 'bold')
 
         self._info_pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
@@ -242,6 +332,7 @@ class VolumitoV1:
         self._columns = urwid.Columns([('weight', 1, urwid.Filler(self._info_pile, valign='top'))])
         self._queue_box = queue_box
         self._playlist_visible = False
+        self._main_widget = self._columns
 
         return self._columns
 
@@ -250,15 +341,24 @@ class VolumitoV1:
         # Respect user toggle: never show if force-hidden
         show = len(queue) > 1 and not self._queue_force_hidden
 
+        if queue:
+            if self._selected_queue_index is None or self._selected_queue_index >= len(queue):
+                try:
+                    self._selected_queue_index = int(current_index)
+                except (TypeError, ValueError):
+                    self._selected_queue_index = 0
+                if not 0 <= self._selected_queue_index < len(queue):
+                    self._selected_queue_index = 0
+        else:
+            self._selected_queue_index = None
+
         if show:
             items = [
                 self._make_queue_item(track, i, current_index)
                 for i, track in enumerate(queue)
             ]
             self._queue_walker[:] = items
-            # scroll so current track is visible
-            if 0 <= current_index < len(items):
-                self._queue_walker.set_focus(current_index)
+            self._queue_walker.set_focus(self._selected_queue_index)
         else:
             self._queue_walker[:] = [urwid.Text(' No queue')]
 
@@ -349,14 +449,14 @@ class VolumitoV1:
         # collect candidate values (prefer top-level if present)
         seek_candidates = []
         dur_candidates = []
-        for k in ('seek', 'position', 'elapsed', 'progress'):
+        for k in ('seek', 'elapsed', 'progress'):
             if k in s:
                 seek_candidates.append(s.get(k))
         for k in ('duration', 'trackDuration', 'totalTime', 'length', 'tracklength'):
             if k in s:
                 dur_candidates.append(s.get(k))
         # extend with deep search
-        seek_candidates.extend(_deep_find_all(s, ['seek', 'position', 'elapsed', 'progress']))
+        seek_candidates.extend(_deep_find_all(s, ['seek', 'elapsed', 'progress']))
         dur_candidates.extend(_deep_find_all(s, ['duration', 'trackduration', 'totaltime', 'length', 'tracklength', 'time', 'total']))
 
         def _to_number(v):
@@ -492,9 +592,30 @@ class VolumitoV1:
         kstr = key if isinstance(key, str) else str(key)
         klower = kstr.lower()
 
+        if klower in ('esc', 'escape') and self._main_widget:
+            self.loop.widget = self._main_widget
+            return
+
         # quit
         if klower == 'q':
             raise urwid.ExitMainLoop()
+
+        if klower == 'h':
+            self._show_host_picker()
+            return
+
+        if self.loop and self.loop.widget is not self._main_widget:
+            return
+
+        if klower in ('up', 'key_up'):
+            self._navigate_queue(-1)
+            return
+        if klower in ('down', 'key_down'):
+            self._navigate_queue(1)
+            return
+        if klower in ('enter', 'return'):
+            self._play_selected_queue_track()
+            return
 
         # toggle queue pane visibility
         if klower == 'u':
@@ -551,7 +672,84 @@ class VolumitoV1:
             self._send_cmd('next')
             return
 
+    def _show_host_picker(self):
+        if not self.discovered_devices:
+            self.discovered_devices = discover_volumio_devices()
+
+        if self.discovered_devices:
+            choices = []
+            for device in self.discovered_devices:
+                button = urwid.Button(f"{device['name']} ({device['host']})")
+                urwid.connect_signal(
+                    button,
+                    "click",
+                    self._select_server,
+                    user_args=(device,),
+                )
+                choices.append(button)
+        else:
+            choices = [urwid.Text("No Volumio units found on the LAN.")]
+        cancel = urwid.Button("Cancel")
+        urwid.connect_signal(cancel, "click", self._close_host_picker)
+        choices.append(cancel)
+        picker = urwid.LineBox(
+            urwid.ListBox(urwid.SimpleFocusListWalker(choices)),
+            title="Volumio servers",
+        )
+        self.loop.widget = urwid.Overlay(
+            picker,
+            self._main_widget,
+            align="center",
+            width=("relative", 70),
+            valign="middle",
+            height=("relative", 60),
+        )
+
+    def _close_host_picker(self, button=None):
+        self.loop.widget = self._main_widget
+
+    def _select_server(self, device, button=None):
+        self._set_server(device)
+        self.server_text.set_text(device["host"])
+        with self._status_lock:
+            self.status.clear()
+        with self._queue_lock:
+            self.queue.clear()
+        self._close_host_picker()
+
+    def _navigate_queue(self, direction):
+        if not self._playlist_visible:
+            return
+        with self._queue_lock:
+            queue = list(self.queue)
+        if not queue:
+            return
+
+        selected = self._selected_queue_index
+        if selected is None:
+            selected = 0
+        self._selected_queue_index = max(0, min(len(queue) - 1, selected + direction))
+        with self._status_lock:
+            current_index = self.status.get('position', 0)
+        try:
+            current_index = int(current_index)
+        except (TypeError, ValueError):
+            current_index = 0
+        self._update_queue_pane(queue, current_index)
+
+    def _play_selected_queue_track(self):
+        if not self._playlist_visible or self._selected_queue_index is None:
+            return
+        with self._queue_lock:
+            queue_length = len(self.queue)
+        if self._selected_queue_index >= queue_length:
+            return
+        self._send_cmd("play", f"N={self._selected_queue_index}")
+
     def _change_volume(self, delta):
+        url = self._api_url("commands/?cmd=volume&volume=")
+        if not url:
+            return
         try:
             with self._status_lock:
                 cur = int(self.status.get('volume', 0))
@@ -560,10 +758,13 @@ class VolumitoV1:
         new = max(0, min(100, cur + delta))
         with self._status_lock:
             self.status['volume'] = new
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=volume&volume=" + str(new)
+        url += str(new)
         threading.Thread(target=lambda: self._safe_get(url), daemon=True).start()
 
     def _toggle_play(self):
+        url = self._api_url("commands/?cmd=")
+        if not url:
+            return
         with self._status_lock:
             cur = str(self.status.get('status', '')).lower()
         if 'play' in cur:
@@ -574,21 +775,27 @@ class VolumitoV1:
             new_state = 'play'
         with self._status_lock:
             self.status['status'] = new_state
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=" + cmd
+        url += cmd
         threading.Thread(target=lambda: self._safe_get(url), daemon=True).start()
 
     def _toggle_shuffle(self):
+        url = self._api_url("commands/?cmd=random")
+        if not url:
+            return
         with self._status_lock:
             cur = bool(self.status.get('random', False))
         new_state = not cur
         with self._status_lock:
             self.status['random'] = new_state
             self.status['shuffle'] = new_state  # keep shuffle in sync for UI display
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=random"
         threading.Thread(target=lambda: self._safe_get(url), daemon=True).start()
 
-    def _send_cmd(self, cmd):
-        url = "http://" + self.config.get("volumio_host") + "/api/v1/commands/?cmd=" + cmd
+    def _send_cmd(self, cmd, query=None):
+        url = self._api_url(f"commands/?cmd={cmd}")
+        if not url:
+            return
+        if query:
+            url += f"&{query}"
         # send the command and then refresh state to reflect track change quickly
         def _worker(u):
             try:
@@ -597,7 +804,7 @@ class VolumitoV1:
                 pass
             # attempt to fetch updated state
             try:
-                r = self.session.get("http://" + self.config.get("volumio_host") + "/api/v1/getState", timeout=2)
+                r = self.session.get(self._api_url("getState"), timeout=2)
                 if r.status_code == 200:
                     with self._status_lock:
                         self._merge_status(r.json())
@@ -606,7 +813,7 @@ class VolumitoV1:
         threading.Thread(target=_worker, args=(url,), daemon=True).start()
 
     def _merge_status(self, new):
-        """Merge new status dict into self.status while avoiding seek/position bounce
+        """Merge new status dict into self.status while avoiding seek bounce
         if a recent seek was requested, prefer the recent seek unless the device's
         reported seek is close to the requested one."""
         if not isinstance(new, dict):
@@ -616,7 +823,7 @@ class VolumitoV1:
             target = recent[0]
             # try to extract reported seek/position from new
             reported = None
-            for k in ('seek', 'position', 'elapsed', 'progress'):
+            for k in ('seek', 'elapsed', 'progress'):
                 if k in new:
                     try:
                         rv = float(new[k])
@@ -632,9 +839,9 @@ class VolumitoV1:
                 self.status.update(new)
                 self._recent_seek = None
                 return
-            # otherwise ignore seek/position keys from device so UI keeps requested position
+            # otherwise ignore seek keys from device so UI keeps requested position
             cleaned = dict(new)
-            for k in ('seek', 'position', 'elapsed', 'progress'):
+            for k in ('seek', 'elapsed', 'progress'):
                 cleaned.pop(k, None)
             self.status.update(cleaned)
             return
@@ -649,6 +856,9 @@ class VolumitoV1:
 
     def _seek_relative(self, delta_seconds):
         """Seek relative by delta_seconds (positive or negative). Attempts several seek command variants and updates UI immediately."""
+        base_url = self._api_url("commands/")
+        if not base_url:
+            return
         with self._status_lock:
             s = dict(self.status)
         def _to_seconds_simple(v):
@@ -671,7 +881,7 @@ class VolumitoV1:
             return f
 
         seek = None
-        for k in ('seek', 'position', 'elapsed', 'progress'):
+        for k in ('seek', 'elapsed', 'progress'):
             if k in s:
                 seek = s.get(k)
                 break
@@ -689,16 +899,12 @@ class VolumitoV1:
             new_pos = min(new_pos, dur_s)
 
         with self._status_lock:
+            orig_seek = s.get('seek')
             try:
-                orig_seek = s.get('seek')
-                if orig_seek is not None and isinstance(orig_seek, (int, float)) and float(orig_seek) > 1000:
-                    self.status['seek'] = int(new_pos * 1000)
-                else:
-                    self.status['seek'] = int(new_pos)
-                self.status['position'] = int(new_pos)
-            except Exception:
-                self.status['seek'] = int(new_pos)
-                self.status['position'] = int(new_pos)
+                seek_is_milliseconds = float(orig_seek) > 1000
+            except (TypeError, ValueError):
+                seek_is_milliseconds = False
+            self.status['seek'] = int(new_pos * 1000) if seek_is_milliseconds else int(new_pos)
             # mark recent seek to avoid immediate bounce from device-reported old position
             try:
                 self._recent_seek = (float(new_pos), time.time())
@@ -706,29 +912,22 @@ class VolumitoV1:
                 self._recent_seek = (new_pos, time.time())
 
         secs = int(new_pos)
-        msecs = int(new_pos * 1000)
-        candidates = [
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&value={secs}",
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&position={secs}",
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&seek={msecs}",
-            f"http://{self.config.get('volumio_host')}/api/v1/commands/?cmd=seek&seek={secs}",
-        ]
+        seek_url = f"{base_url}?cmd=seek&position={secs}"
 
-        def _worker(u_list):
-            for u in u_list:
-                try:
-                    self.session.get(u, timeout=2)
-                except Exception:
-                    continue
+        def _worker():
             try:
-                r = self.session.get(f"http://{self.config.get('volumio_host')}/api/v1/getState", timeout=2)
+                self.session.get(seek_url, timeout=2)
+            except Exception:
+                pass
+            try:
+                r = self.session.get(self._api_url("getState"), timeout=2)
                 if r.status_code == 200:
                     with self._status_lock:
                         self._merge_status(r.json())
             except Exception:
                 pass
 
-        threading.Thread(target=_worker, args=(candidates,), daemon=True).start()
+        threading.Thread(target=_worker, daemon=True).start()
 
     def run(self):
         # start updater thread
@@ -746,6 +945,8 @@ class VolumitoV1:
             ('pg complete',   'white',   'black'),
             ('queue_item',    'default', 'default'),
             ('queue_current', 'black',   'light cyan'),
+            ('queue_selected', 'black', 'light green'),
+            ('queue_selected_current', 'black', 'light cyan'),
         ]
         self.loop = urwid.MainLoop(top, palette, unhandled_input=self.unhandled_input)
         # start periodic UI refresh
