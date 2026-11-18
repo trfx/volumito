@@ -137,6 +137,120 @@ def test_playlist_navigation_and_enter_play_selected_track(monkeypatch, tmp_path
     assert app._playlist_visible
 
 
+def test_f_adds_current_track_to_volumio_favorites(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    calls = []
+
+    class FakeSocketClient:
+        connected = False
+
+        def __init__(self, **options):
+            calls.append(("client", options))
+
+        def connect(self, url, transports):
+            calls.append(("connect", url, transports))
+            self.connected = True
+
+        def emit(self, event, payload):
+            calls.append(("emit", event, payload))
+
+        def disconnect(self):
+            calls.append(("disconnect",))
+            self.connected = False
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(volumito.socketio, "Client", FakeSocketClient)
+    monkeypatch.setattr(volumito.threading, "Thread", ImmediateThread)
+
+    app.status = {
+        "service": "mpd",
+        "uri": "album/track.flac",
+        "title": "A track",
+    }
+    app.unhandled_input("f")
+    assert ("emit", "addToFavourites", {
+        "service": "mpd",
+        "uri": "album/track.flac",
+        "title": "A track",
+    }) in calls
+
+    calls.clear()
+    app.status = {
+        "trackType": "webradio",
+        "uri": "http://radio.example/stream",
+        "title": "A station",
+    }
+    app.unhandled_input("f")
+    assert ("emit", "addToFavourites", {
+        "service": "webradio",
+        "uri": "http://radio.example/stream",
+        "title": "A station",
+    }) in calls
+
+
+def test_t_toggles_mute_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    requests = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "success"}
+
+    class Session:
+        def get(self, url, timeout):
+            requests.append((url, timeout))
+            return Response()
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    app.session = Session()
+    monkeypatch.setattr(volumito.threading, "Thread", ImmediateThread)
+
+    app.status = {"mute": False}
+    app.unhandled_input("t")
+    assert app.status["mute"] is True
+    app.unhandled_input("t")
+
+    assert requests == [
+        ("http://192.168.1.23/api/v1/commands/?cmd=volume&volume=mute", 3),
+        ("http://192.168.1.23/api/v1/commands/?cmd=volume&volume=unmute", 3),
+    ]
+    assert app.status["mute"] is False
+
+
+def test_muted_state_is_visible_without_changing_volume_level(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.build_ui()
+    app.status = {"volume": 42, "mute": True}
+
+    app.refresh_ui()
+
+    assert app.volume_text.get_text()[0] == "42 (muted)"
+
+
 def test_seek_sends_one_documented_position_and_preserves_queue_index(monkeypatch, tmp_path):
     monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
     app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))

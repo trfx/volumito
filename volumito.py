@@ -10,7 +10,7 @@ If urwid is not installed, the script will instruct how to install it.
 
 TODO:
 - Add error handling for network issues and display a message in the UI
-- Add support for more Volumio commands (e.g. stop, mute, repeat, shuffle)
+- Add support for more Volumio commands (e.g. stop, repeat)
 - Add google/wikipedia search keybind for current track/artist/album
 """
 
@@ -29,6 +29,12 @@ try:
     import requests
 except ImportError:
     print("requests is not installed. Please install it with: pip install requests")
+    sys.exit(1)
+
+try:
+    import socketio
+except ImportError:
+    print("python-socketio is not installed. Please install it with: pip install python-socketio")
     sys.exit(1)
 
 try:
@@ -116,6 +122,8 @@ class VolumitoV1:
         self.queue = []
         self._status_lock = threading.Lock()
         self._queue_lock = threading.Lock()
+        self._notification_lock = threading.Lock()
+        self._notification = None
         self.session = requests.Session()
         self._stop_event = threading.Event()
         self.updater = None
@@ -310,7 +318,21 @@ class VolumitoV1:
             urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        legend = urwid.AttrMap(urwid.Text('+/- vol | p play/pause | </> prev/next | up/down select | Enter play | [/] seek | s shuffle | u queue | h hosts | q quit'), 'bold')
+        legend = urwid.Text([
+            ('bold', '+/-'), ' vol | ',
+            ('bold', 'p'), ' play/pause | ',
+            ('bold', '</>'), ' prev/next | ',
+            ('bold', 'up/down'), ' select | ',
+            ('bold', 'Enter'), ' play | ',
+            ('bold', '[/]'), ' seek | ',
+            ('bold', 'f'), ' favorite | ',
+            ('bold', 'm'), ' music | ',
+            ('bold', 't'), ' mute | ',
+            ('bold', 's'), ' shuffle | ',
+            ('bold', 'u'), ' queue | ',
+            ('bold', 'h'), ' hosts | ',
+            ('bold', 'q'), ' quit',
+        ])
 
         self._info_pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
@@ -431,6 +453,11 @@ class VolumitoV1:
         self.state_value.set_text(state)
         self.shuffle_value.set_text('on' if shuffle else 'off')
         self.bitrate_value.set_text(display_rate)
+        with self._notification_lock:
+            notification = self._notification
+            self._notification = None
+        if notification:
+            self.last_key.set_text(notification)
 
         # update volume text
         try:
@@ -440,7 +467,7 @@ class VolumitoV1:
                 vnum = int(float(vol))
             except Exception:
                 vnum = 0
-        self.volume_text.set_text(str(vnum))
+        self.volume_text.set_text(f"{vnum} (muted)" if s.get('mute') else str(vnum))
 
         # update progress bar
         def _parse_time(v):
@@ -676,6 +703,14 @@ class VolumitoV1:
         # play/pause
         if klower in ('p',):
             self._toggle_play()
+            return
+
+        if klower == 'f':
+            self._favorite_current_track()
+            return
+
+        if klower == 't':
+            self._toggle_mute()
             return
 
         # shuffle
@@ -924,6 +959,104 @@ class VolumitoV1:
         self._music_pages = []
         self._music_menu_error = None
         self.loop.widget = self._main_widget
+
+    def _favorite_current_track(self):
+        with self._status_lock:
+            track = dict(self.status)
+
+        uri = track.get("uri")
+        service = track.get("service")
+        track_type = str(track.get("trackType") or track.get("type") or "").lower()
+        if track_type == "webradio" or str(service).lower() == "webradio":
+            service = "webradio"
+        if not uri or not service:
+            self.last_key.set_text("Cannot favorite the current track: missing URI or service.")
+            return
+
+        payload = {
+            "service": service,
+            "uri": uri,
+            "title": track.get("title"),
+        }
+        title = _safe_str(track.get("title"), "current track")
+        self._send_socket_event(
+            "addToFavourites",
+            payload,
+            f"favorite request for {title}",
+            f"Favorite request sent for {title}.",
+        )
+
+    def _toggle_mute(self):
+        with self._status_lock:
+            muted = bool(self.status.get("mute", False))
+        command = "unmute" if muted else "mute"
+        action = "Unmute" if muted else "Mute"
+        url = self._api_url(f"commands/?cmd=volume&volume={command}")
+        if not url:
+            self.last_key.set_text(f"Cannot {action.lower()}: no Volumio server selected.")
+            return
+
+        self.last_key.set_text(f"Sending {action.lower()} command...")
+
+        def send_command():
+            try:
+                response = self.session.get(url, timeout=3)
+                response.raise_for_status()
+                result = response.json()
+                if isinstance(result, dict) and (result.get("Error") or result.get("error")):
+                    raise ValueError(result.get("Error") or result.get("error"))
+            except (requests.RequestException, ValueError) as error:
+                message = f"Could not {action.lower()}: {error}"
+            else:
+                with self._status_lock:
+                    self.status["mute"] = not muted
+                message = f"{action} command sent."
+            with self._notification_lock:
+                self._notification = message
+
+        threading.Thread(target=send_command, daemon=True).start()
+
+    def _send_socket_event(self, event, payload, action, success_message):
+        base_url = self._base_url()
+        if not base_url:
+            self.last_key.set_text(f"Cannot send {action}: no Volumio server selected.")
+            return
+
+        self.last_key.set_text(f"Sending {action}...")
+
+        def send_event():
+            client = socketio.Client(request_timeout=3, reconnection=False)
+            message = None
+            try:
+                client.connect(base_url, transports=["polling"])
+                if payload is None:
+                    client.emit(event)
+                else:
+                    client.emit(event, payload)
+            except (
+                socketio.exceptions.SocketIOError,
+                requests.RequestException,
+                OSError,
+                TimeoutError,
+            ) as error:
+                message = f"Could not send {action}: {error}"
+            else:
+                message = success_message
+            finally:
+                if client.connected:
+                    try:
+                        client.disconnect()
+                    except (
+                        socketio.exceptions.SocketIOError,
+                        requests.RequestException,
+                        OSError,
+                        TimeoutError,
+                    ) as error:
+                        message = f"{action.capitalize()} may have been sent, but disconnect failed: {error}"
+                with self._notification_lock:
+                    self._notification = message
+
+        threading.Thread(target=send_event, daemon=True).start()
 
     def _play_selected_queue_track(self):
         if not self._playlist_visible:
