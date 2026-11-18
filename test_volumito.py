@@ -131,6 +131,10 @@ def test_playlist_navigation_and_enter_play_selected_track(monkeypatch, tmp_path
     app.unhandled_input("enter")
 
     assert commands == [("play", "N=2")]
+    app.unhandled_input("esc")
+    assert not app._playlist_visible
+    app.unhandled_input("u")
+    assert app._playlist_visible
 
 
 def test_seek_sends_one_documented_position_and_preserves_queue_index(monkeypatch, tmp_path):
@@ -250,3 +254,40 @@ def test_music_menu_browses_folders_and_plays_selected_track(monkeypatch, tmp_pa
     )]
     assert not app._music_menu_open
     assert app.loop.widget is app._main_widget
+
+
+def test_music_menu_m_toggles_closed_from_nested_page(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+
+    def load_page(uri, title):
+        app._music_pages.append({
+            "uri": uri,
+            "title": title,
+            "items": [],
+            "focus_index": None,
+        })
+        app._render_music_menu()
+
+    monkeypatch.setattr(app, "_load_music_page", load_page)
+
+    app.unhandled_input("m")
+    assert app._music_menu_open
+    app._music_pages.append({
+        "uri": "nested",
+        "title": "Nested",
+        "items": [],
+        "focus_index": None,
+    })
+    app._render_music_menu()
+
+    app.unhandled_input("m")
+    assert not app._music_menu_open
+    assert app._music_pages == []
+    assert app.loop.widget is app._main_widget
+
+    app.unhandled_input("m")
+    assert app._music_menu_open
+    assert [page["title"] for page in app._music_pages] == ["Music"]

@@ -396,6 +396,17 @@ class VolumitoV1:
             ]
             self._playlist_visible = False
 
+    def _refresh_queue_pane(self):
+        with self._queue_lock:
+            queue = list(self.queue)
+        with self._status_lock:
+            current_index = self.status.get('position', 0)
+        try:
+            current_index = int(current_index)
+        except (TypeError, ValueError):
+            current_index = 0
+        self._update_queue_pane(queue, current_index)
+
     def refresh_ui(self, loop=None, user_data=None):
         with self._status_lock:
             s = dict(self.status)
@@ -615,6 +626,9 @@ class VolumitoV1:
         if klower in ('esc', 'escape') and self._main_widget:
             if self._music_menu_open:
                 self._music_menu_back()
+            elif self._playlist_visible:
+                self._queue_force_hidden = True
+                self._refresh_queue_pane()
             else:
                 self.loop.widget = self._main_widget
             return
@@ -622,6 +636,10 @@ class VolumitoV1:
         # quit
         if klower == 'q':
             raise urwid.ExitMainLoop()
+
+        if self._music_menu_open and klower == 'm':
+            self._close_music_menu()
+            return
 
         if self._music_menu_open and klower in ('enter', 'return'):
             self._activate_music_menu_item()
@@ -644,20 +662,7 @@ class VolumitoV1:
         # toggle queue pane visibility
         if klower == 'u':
             self._queue_force_hidden = not self._queue_force_hidden
-            # force an immediate queue pane update using current state
-            with self._queue_lock:
-                queue = list(self.queue)
-            with self._status_lock:
-                s = dict(self.status)
-            current_index = s.get('position', 0)
-            try:
-                current_index = int(current_index)
-            except Exception:
-                current_index = 0
-            try:
-                self._update_queue_pane(queue, current_index)
-            except Exception:
-                pass
+            self._refresh_queue_pane()
             return
 
         # volume
@@ -904,9 +909,7 @@ class VolumitoV1:
             self._render_music_menu()
             return
 
-        self._music_menu_open = False
-        self._music_pages = []
-        self.loop.widget = self._main_widget
+        self._close_music_menu()
 
     def _music_menu_back(self):
         if len(self._music_pages) > 1:
@@ -914,6 +917,9 @@ class VolumitoV1:
             self._music_menu_error = None
             self._render_music_menu()
             return
+        self._close_music_menu()
+
+    def _close_music_menu(self):
         self._music_menu_open = False
         self._music_pages = []
         self._music_menu_error = None
