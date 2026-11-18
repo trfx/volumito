@@ -10,7 +10,7 @@ If urwid is not installed, the script will instruct how to install it.
 
 TODO:
 - Add error handling for network issues and display a message in the UI
-- Add support for more Volumio commands (e.g. stop, mute, repeat, shuffle)
+- Add support for more Volumio commands (e.g. stop, repeat)
 - Add google/wikipedia search keybind for current track/artist/album
 """
 
@@ -29,6 +29,12 @@ try:
     import requests
 except ImportError:
     print("requests is not installed. Please install it with: pip install requests")
+    sys.exit(1)
+
+try:
+    import socketio
+except ImportError:
+    print("python-socketio is not installed. Please install it with: pip install python-socketio")
     sys.exit(1)
 
 try:
@@ -116,6 +122,8 @@ class VolumitoV1:
         self.queue = []
         self._status_lock = threading.Lock()
         self._queue_lock = threading.Lock()
+        self._notification_lock = threading.Lock()
+        self._notification = None
         self.session = requests.Session()
         self._stop_event = threading.Event()
         self.updater = None
@@ -125,11 +133,17 @@ class VolumitoV1:
         # playlist walker/listbox references (built in build_ui)
         self._queue_walker = None
         self._queue_listbox = None
-        self._selected_queue_index = None
+        self._queue_rows = []
+        self._queue_snapshot = None
         # columns widget reference so we can show/hide playlist pane
         self._columns = None
         self._playlist_visible = False
         self._main_widget = None
+        self._music_menu_open = False
+        self._music_pages = []
+        self._music_menu_error = None
+        self._music_menu_walker = None
+        self._music_menu_items = []
         # user-controlled toggle: when True, hide queue pane regardless of queue size
         self._queue_force_hidden = False
 
@@ -220,18 +234,19 @@ class VolumitoV1:
             time.sleep(1)
 
     def _make_queue_item(self, track, index, current_index):
-        """Build a urwid Text widget for a single queue entry."""
+        """Build a selectable row for a single queue entry."""
         title = _safe_str(track.get("title") or track.get("name"), "Unknown")
         artist = _safe_str(track.get("artist"), "")
         label = f" {index + 1:>3}. {title}"
         if artist:
             label += f"  [{artist}]"
-        if index == self._selected_queue_index:
-            style = 'queue_selected_current' if index == current_index else 'queue_selected'
-            return urwid.AttrMap(urwid.Text(label, wrap='clip'), style)
-        if index == current_index:
-            return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_current')
-        return urwid.AttrMap(urwid.Text(label, wrap='clip'), 'queue_item')
+        style = 'queue_current' if index == current_index else 'queue_item'
+        focus_style = 'queue_selected_current' if index == current_index else 'queue_selected'
+        return urwid.AttrMap(
+            urwid.SelectableIcon(label, cursor_position=0, wrap='clip'),
+            style,
+            focus_style,
+        )
 
     def build_ui(self):
         # Widgets that will be updated
@@ -258,7 +273,7 @@ class VolumitoV1:
         self.server_text = urwid.Text(_safe_str(self.config.get("volumio_host"), "Not found"))
         self.last_key = urwid.Text('')
         # progress bar for visual track progress
-        self.progress = urwid.ProgressBar('pg normal', 'pg complete', 0, 100)
+        self.progress = urwid.ProgressBar('pg normal', 'highlight', 0, 100)
 
         # Rows with colored value using palette entry 'title'
         row_title = urwid.Columns([
@@ -303,7 +318,21 @@ class VolumitoV1:
             urwid.AttrMap(self.server_text, 'normal')
         ])
 
-        legend = urwid.AttrMap(urwid.Text('+/- vol | p play/pause | </> prev/next | up/down select | Enter play | [/] seek | s shuffle | u queue | h hosts | q quit'), 'bold')
+        legend = urwid.Text([
+            ('bold', '+/-'), ' vol | ',
+            ('bold', 'p'), ' play/pause | ',
+            ('bold', '</>'), ' prev/next | ',
+            ('bold', 'up/down'), ' select | ',
+            ('bold', 'Enter'), ' play | ',
+            ('bold', '[/]'), ' seek | ',
+            ('bold', 'f'), ' favorite | ',
+            ('bold', 'm'), ' music | ',
+            ('bold', 't'), ' mute | ',
+            ('bold', 's'), ' shuffle | ',
+            ('bold', 'u'), ' queue | ',
+            ('bold', 'h'), ' hosts | ',
+            ('bold', 'q'), ' quit',
+        ])
 
         self._info_pile = urwid.Pile([
             urwid.AttrMap(self.header, 'header'),
@@ -337,30 +366,42 @@ class VolumitoV1:
         return self._columns
 
     def _update_queue_pane(self, queue, current_index):
-        """Rebuild the queue walker contents and show/hide the pane as needed."""
+        """Update queue rows while preserving list focus and scroll position."""
         # Respect user toggle: never show if force-hidden
         show = len(queue) > 1 and not self._queue_force_hidden
 
-        if queue:
-            if self._selected_queue_index is None or self._selected_queue_index >= len(queue):
-                try:
-                    self._selected_queue_index = int(current_index)
-                except (TypeError, ValueError):
-                    self._selected_queue_index = 0
-                if not 0 <= self._selected_queue_index < len(queue):
-                    self._selected_queue_index = 0
-        else:
-            self._selected_queue_index = None
-
         if show:
-            items = [
-                self._make_queue_item(track, i, current_index)
-                for i, track in enumerate(queue)
-            ]
-            self._queue_walker[:] = items
-            self._queue_walker.set_focus(self._selected_queue_index)
+            snapshot = tuple(
+                (track.get("uri"), track.get("title"), track.get("name"), track.get("artist"))
+                for track in queue
+            )
+            if snapshot != self._queue_snapshot:
+                focus_position = self._queue_walker.focus
+                self._queue_rows = [
+                    self._make_queue_item(track, i, current_index)
+                    for i, track in enumerate(queue)
+                ]
+                self._queue_walker[:] = self._queue_rows
+                if self._queue_snapshot is None:
+                    try:
+                        focus_position = int(current_index)
+                    except (TypeError, ValueError):
+                        focus_position = 0
+                if not 0 <= focus_position < len(self._queue_rows):
+                    focus_position = 0
+                self._queue_walker.set_focus(focus_position)
+                self._queue_snapshot = snapshot
+
+            for index, row in enumerate(self._queue_rows):
+                current = index == current_index
+                row.set_attr_map({None: 'queue_current' if current else 'queue_item'})
+                row.set_focus_map({
+                    None: 'queue_selected_current' if current else 'queue_selected'
+                })
         else:
             self._queue_walker[:] = [urwid.Text(' No queue')]
+            self._queue_rows = []
+            self._queue_snapshot = None
 
         if show and not self._playlist_visible:
             # Add playlist column
@@ -369,12 +410,24 @@ class VolumitoV1:
                 (self._queue_box, self._columns.options('weight', 1)),
             ]
             self._playlist_visible = True
+            self._columns.focus_position = 1
         elif not show and self._playlist_visible:
             # Remove playlist column
             self._columns.contents = [
                 (urwid.Filler(self._info_pile, valign='top'), self._columns.options('weight', 1)),
             ]
             self._playlist_visible = False
+
+    def _refresh_queue_pane(self):
+        with self._queue_lock:
+            queue = list(self.queue)
+        with self._status_lock:
+            current_index = self.status.get('position', 0)
+        try:
+            current_index = int(current_index)
+        except (TypeError, ValueError):
+            current_index = 0
+        self._update_queue_pane(queue, current_index)
 
     def refresh_ui(self, loop=None, user_data=None):
         with self._status_lock:
@@ -400,6 +453,11 @@ class VolumitoV1:
         self.state_value.set_text(state)
         self.shuffle_value.set_text('on' if shuffle else 'off')
         self.bitrate_value.set_text(display_rate)
+        with self._notification_lock:
+            notification = self._notification
+            self._notification = None
+        if notification:
+            self.last_key.set_text(notification)
 
         # update volume text
         try:
@@ -409,7 +467,7 @@ class VolumitoV1:
                 vnum = int(float(vol))
             except Exception:
                 vnum = 0
-        self.volume_text.set_text(str(vnum))
+        self.volume_text.set_text(f"{vnum} (muted)" if s.get('mute') else str(vnum))
 
         # update progress bar
         def _parse_time(v):
@@ -593,26 +651,37 @@ class VolumitoV1:
         klower = kstr.lower()
 
         if klower in ('esc', 'escape') and self._main_widget:
-            self.loop.widget = self._main_widget
+            if self._music_menu_open:
+                self._music_menu_back()
+            elif self._playlist_visible:
+                self._queue_force_hidden = True
+                self._refresh_queue_pane()
+            else:
+                self.loop.widget = self._main_widget
             return
 
         # quit
         if klower == 'q':
             raise urwid.ExitMainLoop()
 
-        if klower == 'h':
-            self._show_host_picker()
+        if self._music_menu_open and klower == 'm':
+            self._close_music_menu()
+            return
+
+        if self._music_menu_open and klower in ('enter', 'return'):
+            self._activate_music_menu_item()
             return
 
         if self.loop and self.loop.widget is not self._main_widget:
             return
 
-        if klower in ('up', 'key_up'):
-            self._navigate_queue(-1)
+        if klower == 'h':
+            self._show_host_picker()
             return
-        if klower in ('down', 'key_down'):
-            self._navigate_queue(1)
+        if klower == 'm':
+            self._open_music_menu()
             return
+
         if klower in ('enter', 'return'):
             self._play_selected_queue_track()
             return
@@ -620,20 +689,7 @@ class VolumitoV1:
         # toggle queue pane visibility
         if klower == 'u':
             self._queue_force_hidden = not self._queue_force_hidden
-            # force an immediate queue pane update using current state
-            with self._queue_lock:
-                queue = list(self.queue)
-            with self._status_lock:
-                s = dict(self.status)
-            current_index = s.get('position', 0)
-            try:
-                current_index = int(current_index)
-            except Exception:
-                current_index = 0
-            try:
-                self._update_queue_pane(queue, current_index)
-            except Exception:
-                pass
+            self._refresh_queue_pane()
             return
 
         # volume
@@ -647,6 +703,14 @@ class VolumitoV1:
         # play/pause
         if klower in ('p',):
             self._toggle_play()
+            return
+
+        if klower == 'f':
+            self._favorite_current_track()
+            return
+
+        if klower == 't':
+            self._toggle_mute()
             return
 
         # shuffle
@@ -717,34 +781,292 @@ class VolumitoV1:
             self.queue.clear()
         self._close_host_picker()
 
-    def _navigate_queue(self, direction):
+    def _open_music_menu(self):
+        self._music_menu_open = True
+        self._music_pages = []
+        self._music_menu_error = None
+        self._load_music_page(None, "Music")
+
+    def _load_music_page(self, uri, title):
+        url = self._api_url("browse")
+        if not url:
+            self._music_menu_error = "No Volumio server selected."
+            self._render_music_menu()
+            return
+        try:
+            response = self.session.get(
+                url,
+                params={"uri": uri} if uri else None,
+                timeout=3,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("navigation"), dict):
+                raise ValueError("Volumio returned an invalid browse response.")
+            sections = data["navigation"].get("lists", [])
+            if not isinstance(sections, list):
+                raise ValueError("Volumio returned an invalid browse list.")
+            items = []
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                section_items = section.get("items")
+                if isinstance(section_items, list):
+                    items.extend(item for item in section_items if isinstance(item, dict))
+                elif section.get("uri"):
+                    items.append(section)
+        except (requests.RequestException, ValueError) as error:
+            self._music_menu_error = f"Could not load {title}: {error}"
+            self._render_music_menu()
+            return
+
+        self._music_pages.append({
+            "uri": uri,
+            "title": title,
+            "items": items,
+            "focus_index": None,
+        })
+        self._music_menu_error = None
+        self._render_music_menu()
+
+    def _make_music_menu_row(self, label):
+        return urwid.AttrMap(
+            urwid.SelectableIcon(label, cursor_position=0, wrap="clip"),
+            "queue_item",
+            "queue_selected",
+        )
+
+    @staticmethod
+    def _is_playable_music_item(item):
+        item_type = str(item.get("type", "")).lower()
+        return item_type in ("song", "track", "webradio") or bool(item.get("trackType"))
+
+    def _render_music_menu(self):
+        page = self._music_pages[-1] if self._music_pages else {"title": "Music", "items": []}
+        rows = []
+        self._music_menu_items = []
+        back_offset = 0
+        if len(self._music_pages) > 1:
+            rows.append(self._make_music_menu_row("< Back"))
+            self._music_menu_items.append(None)
+            back_offset = 1
+
+        for item in page["items"]:
+            label = _safe_str(item.get("title") or item.get("name"), "Unknown")
+            if item.get("uri") and not self._is_playable_music_item(item):
+                label += " >"
+            rows.append(self._make_music_menu_row(label))
+            self._music_menu_items.append(item)
+        if not rows:
+            rows.append(urwid.Text("No items found."))
+        if self._music_menu_error:
+            rows.append(urwid.Text(self._music_menu_error, wrap="any"))
+
+        walker = urwid.SimpleListWalker(rows)
+        focus_index = page.get("focus_index")
+        if focus_index is None:
+            focus_index = back_offset
+        else:
+            focus_index += back_offset
+        if 0 <= focus_index < len(rows) and rows[focus_index].selectable():
+            walker.set_focus(focus_index)
+        self._music_menu_walker = walker
+
+        menu = urwid.LineBox(
+            urwid.ListBox(walker),
+            title=page["title"],
+        )
+        self.loop.widget = urwid.Overlay(
+            menu,
+            self._main_widget,
+            align="center",
+            width=("relative", 75),
+            valign="middle",
+            height=("relative", 70),
+        )
+
+    def _activate_music_menu_item(self):
+        if not self._music_menu_walker:
+            return
+        index = self._music_menu_walker.focus
+        if index >= len(self._music_menu_items):
+            return
+        item = self._music_menu_items[index]
+        if item is None:
+            self._music_menu_back()
+            return
+        if self._music_pages:
+            self._music_pages[-1]["focus_index"] = index - (1 if len(self._music_pages) > 1 else 0)
+        self._select_music_item(item)
+
+    def _select_music_item(self, item, button=None):
+        if self._is_playable_music_item(item):
+            self._play_music_item(item)
+            return
+        uri = item.get("uri")
+        if not uri:
+            self._music_menu_error = "This menu item cannot be opened."
+            self._render_music_menu()
+            return
+        title = _safe_str(item.get("title") or item.get("name"), "Music")
+        self._load_music_page(uri, title)
+
+    def _play_music_item(self, item):
+        page = self._music_pages[-1] if self._music_pages else {}
+        siblings = [
+            track for track in page.get("items", [])
+            if self._is_playable_music_item(track)
+        ]
+        if not siblings:
+            siblings = [item]
+        selected_index = next(
+            (index for index, track in enumerate(siblings) if track is item or track == item),
+            0,
+        )
+        ordered_tracks = siblings[selected_index:] + siblings[:selected_index]
+        url = self._api_url("replaceAndPlay")
+        if not url:
+            self._music_menu_error = "No Volumio server selected."
+            self._render_music_menu()
+            return
+        try:
+            response = self.session.post(
+                url,
+                json={"list": ordered_tracks, "index": 0},
+                timeout=5,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if isinstance(result, dict) and (result.get("Error") or result.get("error")):
+                raise RuntimeError(result.get("Error") or result.get("error"))
+        except (requests.RequestException, ValueError, RuntimeError) as error:
+            self._music_menu_error = f"Could not play track: {error}"
+            self._render_music_menu()
+            return
+
+        self._close_music_menu()
+
+    def _music_menu_back(self):
+        if len(self._music_pages) > 1:
+            self._music_pages.pop()
+            self._music_menu_error = None
+            self._render_music_menu()
+            return
+        self._close_music_menu()
+
+    def _close_music_menu(self):
+        self._music_menu_open = False
+        self._music_pages = []
+        self._music_menu_error = None
+        self.loop.widget = self._main_widget
+
+    def _favorite_current_track(self):
+        with self._status_lock:
+            track = dict(self.status)
+
+        uri = track.get("uri")
+        service = track.get("service")
+        track_type = str(track.get("trackType") or track.get("type") or "").lower()
+        if track_type == "webradio" or str(service).lower() == "webradio":
+            service = "webradio"
+        if not uri or not service:
+            self.last_key.set_text("Cannot favorite the current track: missing URI or service.")
+            return
+
+        payload = {
+            "service": service,
+            "uri": uri,
+            "title": track.get("title"),
+        }
+        title = _safe_str(track.get("title"), "current track")
+        self._send_socket_event(
+            "addToFavourites",
+            payload,
+            f"favorite request for {title}",
+            f"Favorite request sent for {title}.",
+        )
+
+    def _toggle_mute(self):
+        with self._status_lock:
+            muted = bool(self.status.get("mute", False))
+        command = "unmute" if muted else "mute"
+        action = "Unmute" if muted else "Mute"
+        url = self._api_url(f"commands/?cmd=volume&volume={command}")
+        if not url:
+            self.last_key.set_text(f"Cannot {action.lower()}: no Volumio server selected.")
+            return
+
+        self.last_key.set_text(f"Sending {action.lower()} command...")
+
+        def send_command():
+            try:
+                response = self.session.get(url, timeout=3)
+                response.raise_for_status()
+                result = response.json()
+                if isinstance(result, dict) and (result.get("Error") or result.get("error")):
+                    raise ValueError(result.get("Error") or result.get("error"))
+            except (requests.RequestException, ValueError) as error:
+                message = f"Could not {action.lower()}: {error}"
+            else:
+                with self._status_lock:
+                    self.status["mute"] = not muted
+                message = f"{action} command sent."
+            with self._notification_lock:
+                self._notification = message
+
+        threading.Thread(target=send_command, daemon=True).start()
+
+    def _send_socket_event(self, event, payload, action, success_message):
+        base_url = self._base_url()
+        if not base_url:
+            self.last_key.set_text(f"Cannot send {action}: no Volumio server selected.")
+            return
+
+        self.last_key.set_text(f"Sending {action}...")
+
+        def send_event():
+            client = socketio.Client(request_timeout=3, reconnection=False)
+            message = None
+            try:
+                client.connect(base_url, transports=["polling"])
+                if payload is None:
+                    client.emit(event)
+                else:
+                    client.emit(event, payload)
+            except (
+                socketio.exceptions.SocketIOError,
+                requests.RequestException,
+                OSError,
+                TimeoutError,
+            ) as error:
+                message = f"Could not send {action}: {error}"
+            else:
+                message = success_message
+            finally:
+                if client.connected:
+                    try:
+                        client.disconnect()
+                    except (
+                        socketio.exceptions.SocketIOError,
+                        requests.RequestException,
+                        OSError,
+                        TimeoutError,
+                    ) as error:
+                        message = f"{action.capitalize()} may have been sent, but disconnect failed: {error}"
+                with self._notification_lock:
+                    self._notification = message
+
+        threading.Thread(target=send_event, daemon=True).start()
+
+    def _play_selected_queue_track(self):
         if not self._playlist_visible:
             return
         with self._queue_lock:
-            queue = list(self.queue)
-        if not queue:
-            return
-
-        selected = self._selected_queue_index
-        if selected is None:
-            selected = 0
-        self._selected_queue_index = max(0, min(len(queue) - 1, selected + direction))
-        with self._status_lock:
-            current_index = self.status.get('position', 0)
-        try:
-            current_index = int(current_index)
-        except (TypeError, ValueError):
-            current_index = 0
-        self._update_queue_pane(queue, current_index)
-
-    def _play_selected_queue_track(self):
-        if not self._playlist_visible or self._selected_queue_index is None:
-            return
-        with self._queue_lock:
             queue_length = len(self.queue)
-        if self._selected_queue_index >= queue_length:
+        selected_index = self._queue_walker.focus
+        if selected_index >= queue_length:
             return
-        self._send_cmd("play", f"N={self._selected_queue_index}")
+        self._send_cmd("play", f"N={selected_index}")
 
     def _change_volume(self, delta):
         url = self._api_url("commands/?cmd=volume&volume=")
@@ -942,7 +1264,6 @@ class VolumitoV1:
             ('normal',        'default', 'default'),
             ('bold',          'bold',    'dark gray'),
             ('pg normal',     'default', 'dark gray'),
-            ('pg complete',   'white',   'black'),
             ('queue_item',    'default', 'default'),
             ('queue_current', 'black',   'light cyan'),
             ('queue_selected', 'black', 'light green'),

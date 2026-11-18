@@ -119,15 +119,136 @@ def test_playlist_navigation_and_enter_play_selected_track(monkeypatch, tmp_path
         lambda command, query=None: commands.append((command, query)),
     )
 
-    app.unhandled_input("up")
-    assert app._selected_queue_index == 0
-    app.unhandled_input("down")
-    app.unhandled_input("down")
-    app.unhandled_input("down")
-    assert app._selected_queue_index == 2
+    app._columns.keypress((100, 24), "up")
+    assert app._queue_walker.focus == 0
+    app._columns.keypress((100, 24), "down")
+    app._columns.keypress((100, 24), "down")
+    app._columns.keypress((100, 24), "down")
+    assert app._queue_walker.focus == 2
+
+    app._update_queue_pane(app.queue, 1)
+    assert app._queue_walker.focus == 2
     app.unhandled_input("enter")
 
     assert commands == [("play", "N=2")]
+    app.unhandled_input("esc")
+    assert not app._playlist_visible
+    app.unhandled_input("u")
+    assert app._playlist_visible
+
+
+def test_f_adds_current_track_to_volumio_favorites(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    calls = []
+
+    class FakeSocketClient:
+        connected = False
+
+        def __init__(self, **options):
+            calls.append(("client", options))
+
+        def connect(self, url, transports):
+            calls.append(("connect", url, transports))
+            self.connected = True
+
+        def emit(self, event, payload):
+            calls.append(("emit", event, payload))
+
+        def disconnect(self):
+            calls.append(("disconnect",))
+            self.connected = False
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(volumito.socketio, "Client", FakeSocketClient)
+    monkeypatch.setattr(volumito.threading, "Thread", ImmediateThread)
+
+    app.status = {
+        "service": "mpd",
+        "uri": "album/track.flac",
+        "title": "A track",
+    }
+    app.unhandled_input("f")
+    assert ("emit", "addToFavourites", {
+        "service": "mpd",
+        "uri": "album/track.flac",
+        "title": "A track",
+    }) in calls
+
+    calls.clear()
+    app.status = {
+        "trackType": "webradio",
+        "uri": "http://radio.example/stream",
+        "title": "A station",
+    }
+    app.unhandled_input("f")
+    assert ("emit", "addToFavourites", {
+        "service": "webradio",
+        "uri": "http://radio.example/stream",
+        "title": "A station",
+    }) in calls
+
+
+def test_t_toggles_mute_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    requests = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "success"}
+
+    class Session:
+        def get(self, url, timeout):
+            requests.append((url, timeout))
+            return Response()
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    app.session = Session()
+    monkeypatch.setattr(volumito.threading, "Thread", ImmediateThread)
+
+    app.status = {"mute": False}
+    app.unhandled_input("t")
+    assert app.status["mute"] is True
+    app.unhandled_input("t")
+
+    assert requests == [
+        ("http://192.168.1.23/api/v1/commands/?cmd=volume&volume=mute", 3),
+        ("http://192.168.1.23/api/v1/commands/?cmd=volume&volume=unmute", 3),
+    ]
+    assert app.status["mute"] is False
+
+
+def test_muted_state_is_visible_without_changing_volume_level(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.build_ui()
+    app.status = {"volume": 42, "mute": True}
+
+    app.refresh_ui()
+
+    assert app.volume_text.get_text()[0] == "42 (muted)"
 
 
 def test_seek_sends_one_documented_position_and_preserves_queue_index(monkeypatch, tmp_path):
@@ -166,3 +287,121 @@ def test_seek_sends_one_documented_position_and_preserves_queue_index(monkeypatc
     ]
     assert app.status["seek"] == 90000
     assert app.status["position"] == 2
+
+
+def test_music_menu_browses_folders_and_plays_selected_track(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    library = {"name": "Music Library", "uri": "music-library"}
+    album = {"name": "Albums", "uri": "albums", "type": "folder"}
+    first_track = {
+        "title": "First track",
+        "uri": "music-library/albums/first.flac",
+        "service": "mpd",
+        "type": "song",
+    }
+    second_track = {
+        "title": "Second track",
+        "uri": "music-library/albums/second.flac",
+        "service": "mpd",
+        "type": "song",
+    }
+    browse_results = {
+        None: {"navigation": {"lists": [library]}},
+        "music-library": {"navigation": {"lists": [{"items": [album]}]}},
+        "albums": {"navigation": {"lists": [{"items": [first_track, second_track]}]}},
+    }
+    browse_requests = []
+    play_requests = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, data):
+            self.data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.data
+
+    class Session:
+        def get(self, url, params=None, timeout=None):
+            uri = params.get("uri") if params else None
+            browse_requests.append((url, uri))
+            return Response(browse_results[uri])
+
+        def post(self, url, json, timeout=None):
+            play_requests.append((url, json))
+            return Response({"response": "success"})
+
+    app.session = Session()
+
+    app.unhandled_input("m")
+    assert app._music_pages[-1]["title"] == "Music"
+    assert app._music_menu_walker[0].selectable()
+    app.unhandled_input("enter")
+    assert app._music_pages[-1]["title"] == "Music Library"
+    assert app._music_menu_items == [None, album]
+    app.unhandled_input("enter")
+    assert app._music_pages[-1]["title"] == "Albums"
+
+    app.unhandled_input("esc")
+    assert app._music_pages[-1]["title"] == "Music Library"
+    app.unhandled_input("enter")
+    app._music_menu_walker.set_focus(2)
+    app.unhandled_input("enter")
+
+    assert browse_requests == [
+        ("http://192.168.1.23/api/v1/browse", None),
+        ("http://192.168.1.23/api/v1/browse", "music-library"),
+        ("http://192.168.1.23/api/v1/browse", "albums"),
+        ("http://192.168.1.23/api/v1/browse", "albums"),
+    ]
+    assert play_requests == [(
+        "http://192.168.1.23/api/v1/replaceAndPlay",
+        {"list": [second_track, first_track], "index": 0},
+    )]
+    assert not app._music_menu_open
+    assert app.loop.widget is app._main_widget
+
+
+def test_music_menu_m_toggles_closed_from_nested_page(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+
+    def load_page(uri, title):
+        app._music_pages.append({
+            "uri": uri,
+            "title": title,
+            "items": [],
+            "focus_index": None,
+        })
+        app._render_music_menu()
+
+    monkeypatch.setattr(app, "_load_music_page", load_page)
+
+    app.unhandled_input("m")
+    assert app._music_menu_open
+    app._music_pages.append({
+        "uri": "nested",
+        "title": "Nested",
+        "items": [],
+        "focus_index": None,
+    })
+    app._render_music_menu()
+
+    app.unhandled_input("m")
+    assert not app._music_menu_open
+    assert app._music_pages == []
+    assert app.loop.widget is app._main_widget
+
+    app.unhandled_input("m")
+    assert app._music_menu_open
+    assert [page["title"] for page in app._music_pages] == ["Music"]
