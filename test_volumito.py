@@ -251,6 +251,120 @@ def test_muted_state_is_visible_without_changing_volume_level(monkeypatch, tmp_p
     assert app.volume_text.get_text()[0] == "42 (muted)"
 
 
+def test_decibel_meters_pulse_only_during_unmuted_play(monkeypatch, tmp_path):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.build_ui()
+
+    app.status = {"status": "play", "mute": False}
+    playing_levels = []
+    right_playing_levels = []
+    for _ in range(8):
+        app.refresh_ui()
+        playing_levels.append(app.left_meter.get_text()[0])
+        right_playing_levels.append(app.right_meter.get_text()[0])
+
+    assert all("▮" in level for level in playing_levels)
+    assert all("▮" in level for level in right_playing_levels)
+    assert len(set(playing_levels)) > 1
+    assert len(set(right_playing_levels)) > 1
+
+    for status, muted in (("pause", False), ("playing", False), ("play", True)):
+        app.status = {"status": status, "mute": muted}
+        app.refresh_ui()
+        assert app.left_meter.get_text()[0] == "·" * 16
+        assert app.right_meter.get_text()[0] == "·" * 16
+
+
+def test_microphone_meter_analyzes_stereo_frames():
+    levels = []
+    meter = volumito.MicrophoneAudioMeter(lambda: None, levels.append, lambda error: None)
+    meter._channels = 2
+    meter.set_active(True)
+
+    meter._audio_callback(
+        [[1.0, 0.25], [-1.0, -0.25], [1.0, 0.25], [-1.0, -0.25]],
+        4,
+        None,
+        None,
+    )
+
+    assert levels[0][0] > levels[0][1] > 0
+
+
+def test_microphone_meter_uses_a_sensitive_dbfs_range():
+    assert volumito._dbfs_to_meter_level(-45) == 8
+    assert volumito._dbfs_to_meter_level(-36) == 13
+    assert volumito._dbfs_to_meter_level(-20) == 16
+
+
+def test_microphone_missing_numpy_reports_the_optional_dependencies(monkeypatch):
+    class FakeSoundDevice:
+        @staticmethod
+        def query_devices(kind):
+            return {"max_input_channels": 2, "default_samplerate": 44100}
+
+        @staticmethod
+        def InputStream(**kwargs):
+            raise ImportError("No module named 'numpy'")
+
+    errors = []
+    meter = volumito.MicrophoneAudioMeter(lambda: None, lambda levels: None, errors.append)
+    monkeypatch.setitem(__import__("sys").modules, "sounddevice", FakeSoundDevice)
+
+    meter._run()
+
+    assert len(errors) == 1
+    assert "numpy" in errors[0]
+    assert "pip install sounddevice numpy" in errors[0]
+
+
+def test_microphone_opt_in_hides_strips_until_available_and_on_error(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    config_dir = tmp_path / "volumito"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("microphone_meter: true\n")
+    app = volumito.VolumitoV1(config_dir=str(config_dir))
+    app.build_ui()
+
+    assert not app._meter_rows_visible
+    active_states = []
+
+    class FakeMeter:
+        def set_active(self, active):
+            active_states.append(active)
+
+    app._microphone_meter = FakeMeter()
+    app.status = {"status": "pause", "mute": False}
+    app.refresh_ui()
+    assert not app._meter_rows_visible
+    assert active_states[-1] is False
+
+    app._microphone_ready_callback()
+    app._microphone_levels_callback((12, 8))
+    app.refresh_ui()
+    assert app._meter_rows_visible
+    assert app.left_meter.get_text()[0] == "·" * 16
+
+    app.status = {"status": "play", "mute": False}
+    app.refresh_ui()
+    assert active_states[-1] is True
+    assert "▮" in app.left_meter.get_text()[0]
+    assert "▮" in app.right_meter.get_text()[0]
+
+    app.status = {"status": "pause", "mute": False}
+    app.refresh_ui()
+    assert active_states[-1] is False
+    assert app.left_meter.get_text()[0] == "·" * 16
+
+    app._microphone_error_callback("Microphone access denied")
+    app.refresh_ui()
+    assert not app._meter_rows_visible
+    assert app.last_key.get_text()[0] == "Microphone access denied"
+
+
 def test_seek_sends_one_documented_position_and_preserves_queue_index(monkeypatch, tmp_path):
     monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
     app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
