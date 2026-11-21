@@ -1052,13 +1052,14 @@ class VolumitoV1:
     @staticmethod
     def _is_playable_music_item(item):
         item_type = str(item.get("type", "")).lower()
-        return item_type in ("song", "track", "webradio") or bool(item.get("trackType"))
+        return item_type in ("song", "track", "webradio", "mywebradio") or bool(
+            item.get("trackType")
+        )
 
     @staticmethod
     def _is_webradio_item(item):
-        return (
-            str(item.get("type") or item.get("trackType") or "").lower() == "webradio"
-        )
+        item_type = str(item.get("type") or item.get("trackType") or "").lower()
+        return item_type in ("webradio", "mywebradio")
 
     def _render_music_menu(self):
         page = self._music_pages[-1] if self._music_pages else {"title": "Music", "items": []}

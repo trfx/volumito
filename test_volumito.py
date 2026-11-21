@@ -553,6 +553,80 @@ def test_music_menu_plays_only_selected_web_radio(monkeypatch, tmp_path):
     assert not app._music_menu_open
 
 
+def test_music_menu_plays_my_web_radio_instead_of_browsing_stream_uri(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
+    app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
+    app.config["volumio_host"] = "192.168.1.23"
+    app.build_ui()
+    app.loop = urwid.MainLoop(app._main_widget, [])
+    web_radio = {"name": "Web Radio", "uri": "radio", "type": "folder"}
+    my_web_radios = {
+        "title": "My Web Radios",
+        "uri": "radio/myWebRadio",
+        "service": "radio",
+        "type": "mywebradio-category",
+    }
+    first_station = {
+        "title": "First station",
+        "uri": "http://radio.example/first",
+        "service": "webradio",
+        "type": "mywebradio",
+    }
+    selected_station = {
+        "title": "Selected station",
+        "uri": "http://radio.example/selected",
+        "service": "webradio",
+        "type": "mywebradio",
+    }
+    browse_results = {
+        None: {"navigation": {"lists": [{"items": [web_radio]}]}},
+        "radio": {"navigation": {"lists": [{"items": [my_web_radios]}]}},
+        "radio/myWebRadio": {
+            "navigation": {"lists": [{"items": [first_station, selected_station]}]}
+        },
+    }
+    browse_requests = []
+    play_requests = []
+
+    class Response:
+        def __init__(self, data):
+            self.data = data
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.data
+
+    class Session:
+        def get(self, url, params=None, timeout=None):
+            uri = params.get("uri") if params else None
+            browse_requests.append(uri)
+            return Response(browse_results[uri])
+
+        def post(self, url, json, timeout=None):
+            play_requests.append((url, json))
+            return Response({"response": "success"})
+
+    app.session = Session()
+
+    app.unhandled_input("m")
+    app.unhandled_input("enter")
+    app.unhandled_input("enter")
+    assert app._music_pages[-1]["title"] == "My Web Radios"
+    app._music_menu_walker.set_focus(2)
+    app.unhandled_input("enter")
+
+    assert browse_requests == [None, "radio", "radio/myWebRadio"]
+    assert play_requests == [(
+        "http://192.168.1.23/api/v1/replaceAndPlay",
+        {"list": [selected_station], "index": 0},
+    )]
+    assert not app._music_menu_open
+
+
 def test_music_menu_m_toggles_closed_from_nested_page(monkeypatch, tmp_path):
     monkeypatch.setattr(volumito, "discover_volumio_devices", lambda: [])
     app = volumito.VolumitoV1(config_dir=str(tmp_path / "volumito"))
