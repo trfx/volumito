@@ -14,6 +14,7 @@ TODO:
 - Add google/wikipedia search keybind for current track/artist/album
 """
 
+import math
 import os
 import sys
 import threading
@@ -59,6 +60,115 @@ def _safe_str(v, fallback='-'):
         return fallback
     s = str(v)
     return s if s.strip() else fallback
+
+
+def _channel_dbfs(samples):
+    values = [float(sample) for sample in samples]
+    if not values:
+        return -120.0
+    peak = max(abs(value) for value in values)
+    if peak == 0:
+        return -120.0
+    rms = math.sqrt(sum(value * value for value in values) / len(values))
+    rms_dbfs = 20 * math.log10(rms) if rms else -120.0
+    peak_dbfs = 20 * math.log10(peak)
+    return max(rms_dbfs, peak_dbfs - 6)
+
+
+def _dbfs_to_meter_level(dbfs):
+    floor_dbfs = -60.0
+    ceiling_dbfs = -30.0
+    scaled = (dbfs - floor_dbfs) / (ceiling_dbfs - floor_dbfs)
+    return max(0, min(16, round(scaled * 16)))
+
+
+class MicrophoneAudioMeter:
+    def __init__(self, on_ready, on_levels, on_error):
+        self._on_ready = on_ready
+        self._on_levels = on_levels
+        self._on_error = on_error
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._desired_active = False
+        self._thread = None
+        self._channels = 1
+        self._smoothed_dbfs = [-60.0, -60.0]
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_active(self, active):
+        with self._state_lock:
+            self._desired_active = bool(active)
+        self._wake_event.set()
+
+    def stop(self):
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        with self._state_lock:
+            if not self._desired_active:
+                return
+        samples = [[], []]
+        for frame in indata:
+            samples[0].append(frame[0])
+            samples[1].append(frame[1] if self._channels > 1 else frame[0])
+
+        levels = []
+        for channel in range(2):
+            dbfs = _channel_dbfs(samples[channel])
+            self._smoothed_dbfs[channel] = (
+                0.3 * dbfs + 0.7 * self._smoothed_dbfs[channel]
+            )
+            levels.append(_dbfs_to_meter_level(self._smoothed_dbfs[channel]))
+        self._on_levels(tuple(levels))
+
+    def _run(self):
+        try:
+            import sounddevice
+
+            device = sounddevice.query_devices(kind='input')
+            self._channels = min(2, int(device.get('max_input_channels', 0)))
+            if self._channels < 1:
+                raise RuntimeError("No microphone input device is available")
+
+            samplerate = device.get('default_samplerate', 44100)
+            with sounddevice.InputStream(
+                samplerate=samplerate,
+                channels=self._channels,
+                blocksize=1024,
+                callback=self._audio_callback,
+            ) as stream:
+                self._on_ready()
+                active = True
+                while not self._stop_event.is_set():
+                    with self._state_lock:
+                        desired_active = self._desired_active
+                    if desired_active != active:
+                        if desired_active:
+                            stream.start()
+                        else:
+                            stream.stop()
+                        active = desired_active
+                    if active and not stream.active:
+                        raise RuntimeError("Microphone input stopped unexpectedly")
+                    self._wake_event.wait(0.1)
+                    self._wake_event.clear()
+        except ImportError as exc:
+            if not self._stop_event.is_set():
+                self._on_error(
+                    f"Microphone dependency missing in {sys.executable}: {exc}. "
+                    f"Install microphone support with: {sys.executable} -m pip "
+                    "install sounddevice numpy"
+                )
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                self._on_error(f"Microphone unavailable: {exc}")
 
 
 def discover_volumio_devices(timeout=2):
@@ -113,6 +223,11 @@ class VolumitoV1:
         self.config_dir = os.path.expanduser(config_dir)
         self.config_file = os.path.join(self.config_dir, "config.yaml")
         self.config = self.check_config(self.config_dir)
+        self._microphone_opt_in = self.config.get("microphone_meter") is True
+        self._microphone_lock = threading.Lock()
+        self._microphone_ready = False
+        self._microphone_levels = (0, 0)
+        self._microphone_meter = None
         self.discovered_devices = []
         if not self.config.get("volumio_host"):
             self.discovered_devices = discover_volumio_devices()
@@ -269,6 +384,11 @@ class VolumitoV1:
         self.length_value = urwid.Text('--:--', wrap='clip')
         self.volume_label = urwid.Text('Volume: ')
         self.volume_text = urwid.Text('--')
+        self.left_meter = urwid.Text('')
+        self.right_meter = urwid.Text('')
+        self._meter_tick = 0
+        self._meter_rows = []
+        self._meter_rows_visible = not self._microphone_opt_in
         self.server_label = urwid.Text('Server: ')
         self.server_text = urwid.Text(_safe_str(self.config.get("volumio_host"), "Not found"))
         self.last_key = urwid.Text('')
@@ -312,6 +432,15 @@ class VolumitoV1:
             ('fixed', 16, self.volume_label),
             urwid.AttrMap(self.volume_text, 'normal')
         ])
+        row_left_meter = urwid.Columns([
+            ('fixed', 16, urwid.Text('Left: ')),
+            self.left_meter,
+        ])
+        row_right_meter = urwid.Columns([
+            ('fixed', 16, urwid.Text('Right: ')),
+            self.right_meter,
+        ])
+        self._meter_rows = [row_left_meter, row_right_meter]
 
         row_server = urwid.Columns([
             ('fixed', 16, self.server_label),
@@ -334,7 +463,7 @@ class VolumitoV1:
             ('bold', 'q'), ' quit',
         ])
 
-        self._info_pile = urwid.Pile([
+        info_widgets = [
             urwid.AttrMap(self.header, 'header'),
             row_title,
             row_artist,
@@ -350,7 +479,12 @@ class VolumitoV1:
             legend,
             urwid.Divider(),
             self.last_key,
-        ])
+        ]
+        self._volume_row = row_volume
+        if self._meter_rows_visible:
+            volume_index = info_widgets.index(row_volume)
+            info_widgets[volume_index + 1:volume_index + 1] = self._meter_rows
+        self._info_pile = urwid.Pile(info_widgets)
 
         # Playlist pane (initially empty)
         self._queue_walker = urwid.SimpleListWalker([urwid.Text(' No queue')])
@@ -364,6 +498,62 @@ class VolumitoV1:
         self._main_widget = self._columns
 
         return self._columns
+
+    def _set_meter_rows_visible(self, visible):
+        if visible == self._meter_rows_visible:
+            return
+        contents = list(self._info_pile.contents)
+        if visible:
+            volume_index = next(
+                index for index, (widget, _) in enumerate(contents)
+                if widget is self._volume_row
+            )
+            options = self._info_pile.options('pack')
+            contents[volume_index + 1:volume_index + 1] = [
+                (row, options) for row in self._meter_rows
+            ]
+        else:
+            contents = [
+                item for item in contents
+                if not any(item[0] is row for row in self._meter_rows)
+            ]
+        self._info_pile.contents[:] = contents
+        self._meter_rows_visible = visible
+
+    def _microphone_ready_callback(self):
+        with self._microphone_lock:
+            self._microphone_ready = True
+
+    def _microphone_levels_callback(self, levels):
+        with self._microphone_lock:
+            self._microphone_levels = levels
+
+    def _microphone_error_callback(self, message):
+        with self._microphone_lock:
+            self._microphone_ready = False
+        with self._notification_lock:
+            self._notification = message
+
+    def _set_meter_levels(self, levels, active):
+        meter_width = 16
+
+        def meter_markup(level):
+            if not active:
+                return [('meter_standby', '·' * meter_width)]
+            segments = []
+            for index in range(meter_width):
+                if index >= level:
+                    segments.append(('meter_empty', '·'))
+                elif index >= meter_width - 3:
+                    segments.append(('meter_high', '▮'))
+                elif index >= meter_width - 7:
+                    segments.append(('meter_mid', '▮'))
+                else:
+                    segments.append(('meter_low', '▮'))
+            return segments
+
+        self.left_meter.set_text(meter_markup(levels[0]))
+        self.right_meter.set_text(meter_markup(levels[1]))
 
     def _update_queue_pane(self, queue, current_index):
         """Update queue rows while preserving list focus and scroll position."""
@@ -468,6 +658,29 @@ class VolumitoV1:
             except Exception:
                 vnum = 0
         self.volume_text.set_text(f"{vnum} (muted)" if s.get('mute') else str(vnum))
+        playing = str(s.get('status', '')).strip().lower() == 'play' and not s.get('mute')
+        if self._microphone_opt_in:
+            if self._microphone_meter:
+                self._microphone_meter.set_active(playing)
+            with self._microphone_lock:
+                microphone_ready = self._microphone_ready
+                microphone_levels = self._microphone_levels
+            self._set_meter_rows_visible(microphone_ready)
+            self._set_meter_levels(microphone_levels, playing)
+        else:
+            self._meter_tick += 1
+            meter_width = 16
+            if playing:
+                levels = (
+                    round((math.sin(self._meter_tick * 0.47) + 1) * (meter_width - 2) / 2) + 1,
+                    round(
+                        (math.sin(self._meter_tick * 0.47 + 1.1) + 1)
+                        * (meter_width - 2) / 2
+                    ) + 1,
+                )
+            else:
+                levels = (0, 0)
+            self._set_meter_levels(levels, playing)
 
         # update progress bar
         def _parse_time(v):
@@ -1274,14 +1487,28 @@ class VolumitoV1:
             ('queue_current', 'black',   'light cyan'),
             ('queue_selected', 'black', 'light green'),
             ('queue_selected_current', 'black', 'light cyan'),
+            ('meter_low', 'light green', 'default'),
+            ('meter_mid', 'yellow', 'default'),
+            ('meter_high', 'light red', 'default'),
+            ('meter_empty', 'dark gray', 'default'),
+            ('meter_standby', 'dark gray', 'default'),
         ]
         self.loop = urwid.MainLoop(top, palette, unhandled_input=self.unhandled_input)
+        if self._microphone_opt_in:
+            self._microphone_meter = MicrophoneAudioMeter(
+                self._microphone_ready_callback,
+                self._microphone_levels_callback,
+                self._microphone_error_callback,
+            )
+            self._microphone_meter.start()
         # start periodic UI refresh
         self.loop.set_alarm_in(0.1, self.refresh_ui)
         try:
             self.loop.run()
         finally:
             self._stop_event.set()
+            if self._microphone_meter:
+                self._microphone_meter.stop()
             if self.updater:
                 self.updater.join(timeout=1)
 
